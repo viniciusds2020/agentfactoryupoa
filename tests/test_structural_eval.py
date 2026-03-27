@@ -36,6 +36,10 @@ class TestStructuralHitAt1:
     def test_both_wrong(self):
         assert structural_hit_at_1("titulo", "X", "capitulo", "II") == 0.0
 
+    def test_roman_arabic_equivalence(self):
+        assert structural_hit_at_1("capitulo", "II", "capitulo", "2") == 1.0
+        assert structural_hit_at_1("capitulo", "2", "capitulo", "II") == 1.0
+
 
 # ── article_coverage ──────────────────────────────────────────────────────
 
@@ -173,6 +177,8 @@ class TestEvaluateStructuralSummary:
         assert result["queries_evaluated"] == 1
         assert result["structural_hit_at_1"] == 1.0
         assert result["article_coverage"] == 1.0
+        assert result["summary_found_rate"] == 1.0
+        assert result["summary_valid_rate"] == 1.0
         assert len(result["per_query"]) == 1
 
     def test_with_no_matching_summaries(self):
@@ -272,3 +278,26 @@ class TestEvaluateStructuralSummary:
         ]
         result = evaluate_structural_summary(summaries, dataset=dataset)
         assert result["article_coverage"] == 0.5
+
+    def test_fallback_success_rate(self):
+        summaries = [
+            {
+                "node_type": "capitulo",
+                "numeral": "II",
+                "label": "CAPITULO II",
+                "artigos_cobertos": [],
+                "resumo_executivo": "Resumo",
+                "status": "fallback_only",
+            },
+        ]
+        dataset = [
+            {
+                "question": "Resuma o Capitulo II",
+                "target_type": "capitulo",
+                "target_numeral": "2",
+                "expected_articles": [],
+                "query_intent": "summary_structural",
+            },
+        ]
+        result = evaluate_structural_summary(summaries, dataset=dataset)
+        assert result["fallback_success_rate"] == 1.0

@@ -97,10 +97,11 @@ FAISS_HNSW_EF_SEARCH=64
 - **Indice macro por capitulo/secao**: capitulos e secoes indexados como chunks especiais no FAISS
 - **Resumos pre-computados por capitulo**: resumo executivo, juridico, pontos-chave, obrigacoes, restricoes e definicoes via LLM
 - **Roteador de intencao**: classifica queries em `summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`
-- **Shortcut para sumarizacao estrutural**: "resuma o capitulo X" usa resumo pre-computado + chunks de suporte (nao depende de retrieval fragmentado)
+- **Shortcut para sumarizacao estrutural**: "resuma o capitulo X" usa resumo pre-computado quando existir; se nao existir, resolve o escopo direto pelo artefato JSON da Prata e gera resumo on-demand
+- **Fallback deterministico para summary**: se o LLM falhar ou devolver JSON invalido, o sistema gera um resumo extrativo local (`fallback_only`) em vez de falhar
 - **Limpeza estrutural pesada**: merge de linhas quebradas, deduplicacao de paragrafos, remocao de numeros de pagina orfaos
 - **Armazenamento semantico dual**: nos estruturais e resumos persistidos em SQLite (document_nodes + document_summaries)
-- **Avaliacao de sumarizacao estrutural**: structural_hit@1, article_coverage, citation_faithfulness, section_boundary_precision
+- **Avaliacao de sumarizacao estrutural**: structural_hit@1, article_coverage, summary_found_rate, summary_valid_rate, summary_scope_accuracy, citation_scope_precision, fallback_success_rate
 - Fallback automatico LLM: Groq 429 → modelos alternativos → Anthropic
 - Streaming SSE de respostas token a token
 - Respostas em PT-BR com citacoes das fontes [N]
@@ -119,6 +120,7 @@ FastAPI (app.py)
    |--- Chat (hibrido + reranking + streaming SSE)
    |    |--- Roteador de intencao (summary_structural / question / locate / comparison)
    |    |--- Shortcut: resumo pre-computado (quando summary_structural)
+   |    |--- Fallback estrutural: artefato JSON da Prata -> resolve capitulo/secao/titulo -> summary on-demand
    |    |--- Pipeline padrao: retrieval + reranking + geracao (demais intencoes)
    |
    |--- Ingestion Bronze/Prata/Ouro (jobs + progresso + artefatos)
@@ -126,6 +128,7 @@ FastAPI (app.py)
    |    |--- Arvore juridica canonica (titulo > capitulo > secao > artigo)
    |    |--- Indexacao macro (capitulos/secoes como chunks FAISS)
    |    |--- Resumos pre-computados via LLM (por capitulo/secao)
+   |    |--- Fallback extrativo local para garantir summary persistivel mesmo sem JSON valido do LLM
    |
    |--- History (SQLite)
    |
@@ -148,9 +151,9 @@ src/
   vectordb.py          â†’ FAISS persistente (data/chroma/)
   lexical.py          â†’ BM25 com stopwords e stemming PT-BR (RSLP)
   ingestion.py        → Parse + chunking juridico + embed + upsert + arvore juridica + macro indexing
-  legal_tree.py       → Arvore juridica canonica (titulo > capitulo > secao > artigo)
-  summaries.py        → Resumos pre-computados por capitulo/secao via LLM
-  chat.py             → Retrieval hibrido + roteador de intencao + summary shortcut + streaming SSE
+  legal_tree.py       → Arvore juridica canonica (titulo > capitulo > secao > artigo) com fallback robusto para headings OCR/noisy
+  summaries.py        → Resumos estruturais via LLM + fallback extrativo deterministico
+  chat.py             → Retrieval hibrido + roteador de intencao + summary shortcut + fallback via artefato JSON da Prata + streaming SSE
   reranker.py         → Reranking deterministico + cross-encoder opcional
   guardrails.py       → Prompt injection, sanitizacao, rate limiting
   prompts.py          → Templates PT-BR com citacoes [N]
@@ -203,6 +206,8 @@ Artigos, paragrafos, incisos e alineas como chunks tradicionais. Permite:
 **Calibracao de score no reranker**: o score final combina similaridade vetorial com cross-encoder normalizado (sigmoid), preservando faixa 0..1 e evitando cortes indevidos por `RETRIEVAL_MIN_SCORE`.
 
 **Resgate estrutural (fallback de recall)**: quando a pergunta cita estrutura normativa (`capitulo`, `secao`, `artigo`), o pipeline suplementa o contexto com chunks cujo metadado estrutural casa com a referencia pedida (ex.: "capitulo 1").
+
+**Atalho por artefato Prata para sumarizacao estrutural**: se `summary_structural` nao encontrar resumo persistido ou se os metadados vetoriais estiverem incompletos, o chat tenta resolver o escopo diretamente no artefato `data/processed/<doc>.json`, usando os blocos `section_header` para localizar `titulo`, `capitulo` e `secao`.
 
 **Pesos dinamicos**: queries literais ("art. 37", "§ 2°") favorecem BM25 (0.65); queries conceituais ("e proibido remunerar?") favorecem embedding (0.65).
 
@@ -262,6 +267,12 @@ Para cada capitulo e secao, o sistema gera automaticamente via LLM:
 
 Os resumos sao persistidos em SQLite (`document_summaries`) e usados como shortcut quando o roteador de intencao detecta `summary_structural`.
 
+Cada resumo tambem carrega metadados de confiabilidade:
+- `status=generated`: resumo estruturado valido retornado pelo LLM
+- `status=fallback_only`: resumo gerado por fallback extrativo local
+- `status=invalid`: payload descartado por schema/validacao
+- `source_hash`, `source_text_length`, `generation_meta`: rastreabilidade do texto-base usado na geracao
+
 ## Roteador de Intencao
 
 O sistema classifica cada pergunta antes de decidir o pipeline:
@@ -274,7 +285,12 @@ O sistema classifica cada pergunta antes de decidir o pipeline:
 | `locate_excerpt` | "Art. 41" | Retrieval com boost estrutural |
 | `comparison` | "Compare capitulo 1 e 2" | Retrieval multi-capitulo |
 
-Quando `summary_structural` e detectado e um resumo pre-computado existe, o sistema usa o resumo como contexto principal (enriquecido com chunks de suporte do FAISS). Isso elimina a dependencia de retrieval fragmentado para perguntas de resumo.
+Quando `summary_structural` e detectado, a ordem de preferencia e:
+1. resumo persistido em `document_summaries`
+2. resolucao direta do escopo no artefato JSON da Prata (`section_header`)
+3. summary on-demand por escopo com fallback extrativo local
+
+Isso elimina a dependencia exclusiva de retrieval fragmentado para perguntas como "Resuma o Capitulo II".
 
 ## Limpeza Estrutural
 
@@ -307,8 +323,9 @@ Configurar via `EMBEDDING_MODEL` no `.env`. Dimensao sempre consultada em runtim
 6. **Ouro**: delete de chunks antigos por `doc_id` + upsert no indice FAISS
 7. **Ouro (juridico)**: construir arvore juridica canonica + indexar macro chunks (capitulos/secoes)
 8. **Ouro (juridico)**: gerar resumos pre-computados por capitulo/secao via LLM
-9. **Ouro (juridico)**: persistir nos e resumos em SQLite (`document_nodes`, `document_summaries`)
-10. Atualizar status/progresso da ingestao e inventario de documentos
+9. **Ouro (juridico)**: se o LLM falhar ou responder malformado, gerar summary extrativo deterministico (`fallback_only`)
+10. **Ouro (juridico)**: persistir nos e resumos em SQLite (`document_nodes`, `document_summaries`)
+11. Atualizar status/progresso da ingestao e inventario de documentos
 
 Dois modos: `POST /ingest` (sincrono) e `POST /ingest/async` (background job).
 
@@ -355,23 +372,25 @@ Sem reindexacao, a base pode manter vetores antigos e degradar recall/precisao d
 2. Validar e sanitizar question + history
 3. Detectar prompt injection
 4. **Classificar intencao da query** (`summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`)
-5. **Se `summary_structural`**: buscar resumo pre-computado no SQLite → se encontrado, montar contexto com resumo + chunks de suporte → gerar resposta → retornar (shortcut)
-6. Classificar query (literal vs conceitual) para pesos dinamicos
-7. Embed query
-8. Busca vetorial + BM25 com fetch window 3x
-9. Fusao RRF com pesos dinamicos
-10. Reranking deterministico (lexical + metadata)
-11. Cross-encoder reranking (opcional, `CROSS_ENCODER_ENABLED=true`)
-12. Combinar score vetorial + score cross-encoder normalizado (0..1)
-13. Expansao de contexto juridico (parent + siblings + referencias)
-14. Resgate estrutural por metadados para "capitulo/secao/artigo"
-15. Sanitizar contexto recuperado
-16. Gerar resposta com LLM usando perfil de dominio
-17. Garantir presenca de citacao [N]
+5. **Se `summary_structural`**: buscar resumo persistido no SQLite
+6. **Se nao encontrar**: tentar resolver `titulo/capitulo/secao` direto no artefato JSON da Prata
+7. **Se encontrar escopo**: gerar summary on-demand (LLM ou fallback extrativo) → montar contexto com resumo + chunks de suporte → retornar
+8. Classificar query (literal vs conceitual) para pesos dinamicos
+9. Embed query
+10. Busca vetorial + BM25 com fetch window 3x
+11. Fusao RRF com pesos dinamicos
+12. Reranking deterministico (lexical + metadata)
+13. Cross-encoder reranking (opcional, `CROSS_ENCODER_ENABLED=true`)
+14. Combinar score vetorial + score cross-encoder normalizado (0..1)
+15. Expansao de contexto juridico (parent + siblings + referencias)
+16. Resgate estrutural por metadados para "capitulo/secao/artigo"
+17. Sanitizar contexto recuperado
+18. Gerar resposta com LLM usando perfil de dominio
+19. Garantir presenca de citacao [N]
 
 Streaming via `POST /chat/message/stream` (SSE).
 
-O shortcut no passo 5 e a diferenca critica: "Resuma o Capitulo II" usa um resumo estavel pre-computado em vez de depender de retrieval fragmentado.
+Os passos 5-7 sao a diferenca critica: "Resuma o Capitulo II" pode ser respondido por resumo persistido ou por resolucao direta do artefato JSON, sem depender apenas de retrieval fragmentado.
 
 ## LLM Fallback (Groq 429)
 
@@ -437,8 +456,11 @@ Metricas especificas para medir qualidade do resumo estrutural:
 |---------|-----------|
 | `structural_hit@1` | Achou o capitulo/secao correto? (1.0 ou 0.0) |
 | `article_coverage` | Fracao dos artigos esperados cobertos pelo resumo |
-| `citation_faithfulness` | Citacoes vieram do capitulo correto? |
-| `section_boundary_precision` | Nao misturou capitulos? (1.0 = sem contaminacao) |
+| `summary_found_rate` | Taxa de perguntas em que um summary foi encontrado/gerado |
+| `summary_valid_rate` | Taxa de summaries validos entre os encontrados |
+| `summary_scope_accuracy` | O resumo veio do escopo estrutural correto? |
+| `citation_scope_precision` | As citacoes/fontes pertencem ao mesmo escopo? |
+| `fallback_success_rate` | Taxa de sucesso quando foi necessario fallback |
 
 Dataset de avaliacao embutido com perguntas como:
 - "Resuma o Capitulo II"
@@ -456,7 +478,8 @@ Dataset de avaliacao embutido com perguntas como:
 - Cross-encoder adiciona ~100-200ms de latencia por query
 - Avaliacao de retrieval usa dataset de referencia embutido
 - Resumos pre-computados dependem de chamada LLM na ingestao (custo adicional)
-- Arvore juridica canonica depende de deteccao correta de TÍTULO/CAPÍTULO/SEÇÃO via regex
+- Para resumir por estrutura sem reingestao, o sistema depende da existencia do artefato `data/processed/<doc>.json`
+- Arvore juridica canonica ainda pode degradar em PDFs muito ruidosos, mas agora existe fallback por artefato JSON da Prata
 - Roteador de intencao usa heuristicas regex (nao ML), pode errar em queries ambiguas
 
 ## Principios de Design

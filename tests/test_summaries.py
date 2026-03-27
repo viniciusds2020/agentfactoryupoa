@@ -9,9 +9,11 @@ import pytest
 from src.legal_tree import LegalNode, LegalTree, build_legal_tree
 from src.summaries import (
     NodeSummary,
+    SummaryStatus,
     _parse_llm_json,
     _truncate_text,
     build_summary_context,
+    generate_summary_from_scope_text,
     generate_node_summary,
     generate_tree_summaries,
 )
@@ -130,6 +132,8 @@ class TestNodeSummaryRoundtrip:
             "resumo_executivo", "resumo_juridico",
             "pontos_chave", "artigos_cobertos",
             "obrigacoes", "restricoes", "definicoes", "text_length",
+            "source_hash", "source_text_length", "status",
+            "validation_errors", "generation_meta",
         }
         assert set(d.keys()) == expected_keys
 
@@ -225,15 +229,16 @@ class TestGenerateNodeSummary:
             summary = generate_node_summary(node)
 
         assert summary.node_id == "test_node_id"
-        assert summary.resumo_executivo == ""
-        assert summary.pontos_chave == []
+        assert summary.resumo_executivo != ""
+        assert summary.status == SummaryStatus.FALLBACK_ONLY
 
     def test_llm_returns_invalid_json(self):
         node = self._make_node()
         with patch("src.llm.chat", return_value="not valid json at all"):
             summary = generate_node_summary(node)
 
-        assert summary.resumo_executivo == ""
+        assert summary.resumo_executivo != ""
+        assert summary.status == SummaryStatus.FALLBACK_ONLY
 
 
 # ── generate_tree_summaries (mocked LLM) ──────────────────────────────────
@@ -286,3 +291,27 @@ class TestGenerateTreeSummaries:
 
         # One chapter was too short, only the other should get a summary
         assert len(summaries) == 1
+
+
+class TestGenerateSummaryFromScopeText:
+    def test_generates_fallback_summary_status(self):
+        mock_response = json.dumps({
+            "resumo_executivo": "Resumo por escopo.",
+            "resumo_juridico": "Resumo tecnico por escopo.",
+            "pontos_chave": ["A"],
+            "artigos_cobertos": ["Art. 1"],
+            "obrigacoes": [],
+            "restricoes": [],
+            "definicoes": [],
+        })
+        with patch("src.llm.chat", return_value=mock_response):
+            summary = generate_summary_from_scope_text(
+                node_id="scope1",
+                node_type="capitulo",
+                label="CAPITULO II",
+                path="TITULO I > CAPITULO II",
+                text="Art. 1 - Conteudo.\nArt. 2 - Conteudo.",
+                articles=["1", "2"],
+            )
+        assert summary.status == SummaryStatus.FALLBACK_ONLY
+        assert summary.resumo_executivo

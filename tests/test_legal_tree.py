@@ -60,6 +60,19 @@ Apenas texto corrido sem títulos, capítulos ou seções.
 Art. 1° - Cláusula genérica de exemplo.
 """
 
+NORMALIZED_HEADINGS_TEXT = """\
+TITULO I - DISPOSICOES GERAIS
+
+CAPITULO II - DOS OBJETIVOS SOCIAIS
+
+Art. 3 - Os objetivos sao:
+Art. 4 - E vedada a distribuicao de lucros.
+
+SECAO I - DAS RESTRICOES
+
+Art. 5 - Nao e permitido.
+"""
+
 
 # ── _extract_numeral ───────────────────────────────────────────────────────
 
@@ -257,6 +270,16 @@ class TestBuildLegalTreeFlat:
 
     def test_root_articles(self, tree: LegalTree):
         assert "1" in tree.root.articles
+
+
+class TestBuildLegalTreeNormalizedFallback:
+    def test_detects_ascii_headings(self):
+        tree = build_legal_tree(NORMALIZED_HEADINGS_TEXT, doc_id="doc4")
+        assert len(tree.get_titles()) == 1
+        assert len(tree.get_chapters()) == 1
+        assert len(tree.get_sections()) == 1
+        node = tree.find_by_numeral("capitulo", "II")
+        assert node is not None
 
 
 # ── LegalNode.to_dict ─────────────────────────────────────────────────────

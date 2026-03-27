@@ -136,6 +136,11 @@ class TestBuildAndIndexLegalTreeFlags:
         mock_summary.restricoes = []
         mock_summary.definicoes = []
         mock_summary.text_length = 100
+        mock_summary.source_hash = "abc"
+        mock_summary.source_text_length = 100
+        mock_summary.status = "generated"
+        mock_summary.validation_errors = []
+        mock_summary.generation_meta = {}
         mock_gen_summaries.return_value = [mock_summary]
 
         settings = MagicMock()
@@ -191,6 +196,11 @@ class TestBuildAndIndexLegalTreeFlags:
         mock_summary.restricoes = []
         mock_summary.definicoes = []
         mock_summary.text_length = 50
+        mock_summary.source_hash = "def"
+        mock_summary.source_text_length = 50
+        mock_summary.status = "generated"
+        mock_summary.validation_errors = []
+        mock_summary.generation_meta = {}
         mock_gen_summaries.return_value = [mock_summary]
 
         mock_llm = MagicMock()

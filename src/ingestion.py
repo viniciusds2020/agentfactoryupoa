@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -190,12 +191,42 @@ class _SectionMarker:
         self.key = key
 
 
+def _normalize_heading_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.upper().strip()
+
+
+def _line_level_key(line: str) -> tuple[int, str] | None:
+    norm = _normalize_heading_text(line)
+    if re.match(r"^TITULO\s+([IVXLCDM]+|\d{1,4})\b", norm):
+        return (1, "title")
+    if re.match(r"^CAPITULO\s+([IVXLCDM]+|\d{1,4})\b", norm):
+        return (2, "section")
+    if re.match(r"^SECAO\s+([IVXLCDM]+|\d{1,4})\b", norm):
+        return (3, "subsection")
+    return None
+
+
 def _detect_sections(text: str) -> list[_SectionMarker]:
     """Scan text for structural headers (Título, Capítulo, Seção) and return ordered markers."""
     markers: list[_SectionMarker] = []
     for level, key, pattern in _SECTION_LEVEL_PATTERNS:
         for m in pattern.finditer(text):
             markers.append(_SectionMarker(offset=m.start(), header=m.group(1).strip(), level=level, key=key))
+
+    # Fallback robusto: detecção por linha com normalização (acento-insensível),
+    # cobre extrações OCR/pipelines onde regex acentuada falha.
+    if not markers or not any(m.key == "section" for m in markers):
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            raw_line = line.rstrip("\r\n")
+            lk = _line_level_key(raw_line)
+            if lk:
+                level, key = lk
+                markers.append(_SectionMarker(offset=offset, header=raw_line.strip(), level=level, key=key))
+            offset += len(line)
+
     markers.sort(key=lambda m: m.offset)
     return markers
 
@@ -1252,6 +1283,11 @@ def _build_and_index_legal_tree(
             restricoes=summary.restricoes,
             definicoes=summary.definicoes,
             text_length=summary.text_length,
+            source_hash=summary.source_hash,
+            source_text_length=summary.source_text_length,
+            status=summary.status,
+            invalid_reason="; ".join(summary.validation_errors),
+            generation_meta=summary.generation_meta,
         )
 
     log_event(logger, 20, "Document summaries generated and persisted",

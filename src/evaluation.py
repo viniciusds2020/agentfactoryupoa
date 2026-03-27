@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -260,9 +261,30 @@ def structural_hit_at_1(
 ) -> float:
     """Check if the retrieved node matches the target (type + numeral). Returns 1.0 or 0.0."""
     if retrieved_node_type.lower() == target_type.lower():
-        if retrieved_numeral.strip().upper() == target_numeral.strip().upper():
+        if _numerals_equivalent(retrieved_numeral, target_numeral):
             return 1.0
     return 0.0
+
+
+def _normalize_numeral_token(value: str) -> str:
+    from src.lexical import _roman_to_int
+    token = value.strip().upper()
+    if not token:
+        return ""
+    if token.isdigit():
+        return str(int(token))
+    arabic = _roman_to_int(token)
+    if arabic > 0:
+        return str(arabic)
+    return token
+
+
+def _numerals_equivalent(a: str, b: str) -> bool:
+    na = _normalize_numeral_token(a)
+    nb = _normalize_numeral_token(b)
+    if na and nb:
+        return na == nb
+    return a.strip().upper() == b.strip().upper()
 
 
 def article_coverage(
@@ -340,6 +362,10 @@ def evaluate_structural_summary(
     queries = dataset or STRUCTURAL_GOLD_QUERIES
 
     results: list[dict] = []
+    found_count = 0
+    valid_count = 0
+    fallback_count = 0
+    fallback_success = 0
     for query in queries:
         target_type = query["target_type"]
         target_numeral = query["target_numeral"]
@@ -347,15 +373,27 @@ def evaluate_structural_summary(
         # Try to find matching summary
         matched = None
         for s in summaries:
-            if (s.get("node_type", "").lower() == target_type.lower()
-                    and target_numeral.upper() in s.get("label", "").upper()):
+            if s.get("node_type", "").lower() != target_type.lower():
+                continue
+            numeral_in_summary = str(s.get("numeral", "")).strip()
+            if not numeral_in_summary:
+                m = re.search(r"(?:T[IÍ]TULO|CAP[IÍ]TULO|SE[CÇ][AÃ]O)\s+([IVXLCDM]+|\d+)", s.get("label", ""), re.IGNORECASE)
+                numeral_in_summary = m.group(1) if m else ""
+            if _numerals_equivalent(numeral_in_summary, target_numeral):
                 matched = s
                 break
 
         if matched:
+            found_count += 1
+            status = str(matched.get("status", "generated")).lower()
+            if status != "invalid":
+                valid_count += 1
+            if status == "fallback_only":
+                fallback_count += 1
+                fallback_success += 1
             hit = structural_hit_at_1(
                 matched.get("node_type", ""),
-                matched.get("numeral", matched.get("label", "")),
+                numeral_in_summary,
                 target_type,
                 target_numeral,
             )
@@ -363,26 +401,41 @@ def evaluate_structural_summary(
                 matched.get("artigos_cobertos", []),
                 query.get("expected_articles", []),
             )
+            scope_acc = 1.0 if hit == 1.0 else 0.0
         else:
             hit = 0.0
             coverage = 0.0
+            scope_acc = 0.0
 
         results.append({
             "question": query["question"],
             "target": f"{target_type} {target_numeral}",
             "matched": matched.get("label", "") if matched else "",
+            "status": matched.get("status", "") if matched else "",
             "structural_hit_at_1": hit,
+            "summary_scope_accuracy": scope_acc,
             "article_coverage": coverage,
+            "citation_scope_precision": scope_acc,  # offline proxy
         })
 
     # Averages
     n = len(results) or 1
     avg_hit = sum(r["structural_hit_at_1"] for r in results) / n
     avg_coverage = sum(r["article_coverage"] for r in results) / n
+    avg_scope = sum(r["summary_scope_accuracy"] for r in results) / n
+    avg_citation_scope = sum(r["citation_scope_precision"] for r in results) / n
+    summary_found_rate = found_count / n
+    summary_valid_rate = (valid_count / found_count) if found_count else 0.0
+    fallback_success_rate = (fallback_success / fallback_count) if fallback_count else 0.0
 
     return {
         "structural_hit_at_1": round(avg_hit, 4),
         "article_coverage": round(avg_coverage, 4),
+        "summary_found_rate": round(summary_found_rate, 4),
+        "summary_valid_rate": round(summary_valid_rate, 4),
+        "summary_scope_accuracy": round(avg_scope, 4),
+        "citation_scope_precision": round(avg_citation_scope, 4),
+        "fallback_success_rate": round(fallback_success_rate, 4),
         "queries_evaluated": len(results),
         "per_query": results,
     }

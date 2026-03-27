@@ -169,6 +169,11 @@ def init_db() -> None:
                     restricoes_json     TEXT NOT NULL DEFAULT '[]',
                     definicoes_json     TEXT NOT NULL DEFAULT '[]',
                     text_length     INTEGER NOT NULL DEFAULT 0,
+                    source_hash     TEXT NOT NULL DEFAULT '',
+                    source_text_length INTEGER NOT NULL DEFAULT 0,
+                    status          TEXT NOT NULL DEFAULT 'generated',
+                    invalid_reason  TEXT NOT NULL DEFAULT '',
+                    generation_meta_json TEXT NOT NULL DEFAULT '{}',
                     created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                     UNIQUE(workspace_id, collection, doc_id, node_id)
                 );
@@ -190,7 +195,29 @@ def init_db() -> None:
                 """
             )
 
+    _ensure_schema_migrations()
     ensure_default_workspace()
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def _ensure_schema_migrations() -> None:
+    """Apply additive migrations for existing local SQLite databases."""
+    with closing(_connect()) as conn:
+        with conn:
+            additions = [
+                ("document_summaries", "source_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("document_summaries", "source_text_length", "INTEGER NOT NULL DEFAULT 0"),
+                ("document_summaries", "status", "TEXT NOT NULL DEFAULT 'generated'"),
+                ("document_summaries", "invalid_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("document_summaries", "generation_meta_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ]
+            for table, column, ddl in additions:
+                if not _column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _row_to_workspace(row: sqlite3.Row) -> Workspace:
@@ -702,6 +729,11 @@ def upsert_document_summary(
     restricoes: list[str] | None = None,
     definicoes: list[str] | None = None,
     text_length: int = 0,
+    source_hash: str = "",
+    source_text_length: int = 0,
+    status: str = "generated",
+    invalid_reason: str = "",
+    generation_meta: dict | None = None,
 ) -> None:
     with closing(_connect()) as conn:
         with conn:
@@ -710,8 +742,9 @@ def upsert_document_summary(
                 INSERT INTO document_summaries (
                     workspace_id, collection, doc_id, node_id, node_type, label, path,
                     resumo_executivo, resumo_juridico, pontos_chave_json, artigos_cobertos_json,
-                    obrigacoes_json, restricoes_json, definicoes_json, text_length
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    obrigacoes_json, restricoes_json, definicoes_json, text_length,
+                    source_hash, source_text_length, status, invalid_reason, generation_meta_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(workspace_id, collection, doc_id, node_id)
                 DO UPDATE SET
                     node_type=excluded.node_type,
@@ -724,7 +757,12 @@ def upsert_document_summary(
                     obrigacoes_json=excluded.obrigacoes_json,
                     restricoes_json=excluded.restricoes_json,
                     definicoes_json=excluded.definicoes_json,
-                    text_length=excluded.text_length
+                    text_length=excluded.text_length,
+                    source_hash=excluded.source_hash,
+                    source_text_length=excluded.source_text_length,
+                    status=excluded.status,
+                    invalid_reason=excluded.invalid_reason,
+                    generation_meta_json=excluded.generation_meta_json
                 """,
                 (
                     workspace_id, collection, doc_id, node_id, node_type, label, path,
@@ -735,6 +773,11 @@ def upsert_document_summary(
                     json.dumps(restricoes or [], ensure_ascii=False),
                     json.dumps(definicoes or [], ensure_ascii=False),
                     text_length,
+                    source_hash,
+                    source_text_length,
+                    status,
+                    invalid_reason,
+                    json.dumps(generation_meta or {}, ensure_ascii=False),
                 ),
             )
 
@@ -774,6 +817,11 @@ def list_document_summaries(
             "restricoes": json.loads(row["restricoes_json"]),
             "definicoes": json.loads(row["definicoes_json"]),
             "text_length": row["text_length"],
+            "source_hash": row["source_hash"] if "source_hash" in row.keys() else "",
+            "source_text_length": row["source_text_length"] if "source_text_length" in row.keys() else row["text_length"],
+            "status": row["status"] if "status" in row.keys() else "generated",
+            "invalid_reason": row["invalid_reason"] if "invalid_reason" in row.keys() else "",
+            "generation_meta": json.loads(row["generation_meta_json"]) if "generation_meta_json" in row.keys() else {},
             "created_at": row["created_at"],
         }
         for row in rows
@@ -801,6 +849,11 @@ def get_summary_by_node(workspace_id: str, collection: str, node_id: str) -> dic
         "restricoes": json.loads(row["restricoes_json"]),
         "definicoes": json.loads(row["definicoes_json"]),
         "text_length": row["text_length"],
+        "source_hash": row["source_hash"] if "source_hash" in row.keys() else "",
+        "source_text_length": row["source_text_length"] if "source_text_length" in row.keys() else row["text_length"],
+        "status": row["status"] if "status" in row.keys() else "generated",
+        "invalid_reason": row["invalid_reason"] if "invalid_reason" in row.keys() else "",
+        "generation_meta": json.loads(row["generation_meta_json"]) if "generation_meta_json" in row.keys() else {},
     }
 
 
@@ -833,6 +886,11 @@ def find_summaries_by_label(
             "restricoes": json.loads(row["restricoes_json"]),
             "definicoes": json.loads(row["definicoes_json"]),
             "text_length": row["text_length"],
+            "source_hash": row["source_hash"] if "source_hash" in row.keys() else "",
+            "source_text_length": row["source_text_length"] if "source_text_length" in row.keys() else row["text_length"],
+            "status": row["status"] if "status" in row.keys() else "generated",
+            "invalid_reason": row["invalid_reason"] if "invalid_reason" in row.keys() else "",
+            "generation_meta": json.loads(row["generation_meta_json"]) if "generation_meta_json" in row.keys() else {},
         }
         for row in rows
     ]

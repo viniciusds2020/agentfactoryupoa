@@ -1,8 +1,10 @@
-"""Semantic retrieval (vector search) and RAG generation."""
+﻿"""Semantic retrieval (vector search) and RAG generation."""
 from __future__ import annotations
 
 import re
 import unicodedata
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -17,7 +19,7 @@ from src.utils import get_logger, log_event
 logger = get_logger(__name__)
 
 
-# ── Context budget management ────────────────────────────────────────────────
+# â”€â”€ Context budget management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _estimate_tokens(text: str, chars_per_token: float = 3.5) -> int:
     """Estimate token count from character length (conservative for PT-BR)."""
@@ -60,7 +62,7 @@ def _trim_to_budget(
     return result
 
 
-# ── Data classes ─────────────────────────────────────────────────────────────
+# â”€â”€ Data classes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class ChatMessage:
@@ -136,6 +138,24 @@ def _is_structural_query(question: str) -> bool:
 
 
 _CHAPTER_REF_RE = re.compile(r"\bcapitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
+_TITLE_REF_RE = re.compile(r"\btitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
+_SECTION_REF_RE = re.compile(r"\bsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
+_SUBSECTION_REF_RE = re.compile(r"\bsubsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
+_ARTICLE_REF_RE = re.compile(r"\bart(?:igo)?\.?\s*([0-9]{1,4})\b", re.IGNORECASE)
+
+_NODE_META_KEYS: dict[str, tuple[str, ...]] = {
+    "titulo": ("titulo", "title"),
+    "capitulo": ("capitulo", "section"),
+    "secao": ("secao", "subsection"),
+    "subsecao": ("subsection",),
+    "artigo": ("artigo",),
+}
+_STRUCTURAL_LABEL_REF_RE: dict[str, re.Pattern] = {
+    "titulo": re.compile(r"\btitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE),
+    "capitulo": re.compile(r"\bcapitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE),
+    "secao": re.compile(r"\bsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE),
+    "subsecao": re.compile(r"\bsubsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE),
+}
 
 
 def _extract_chapter_refs(question: str) -> set[str]:
@@ -144,6 +164,25 @@ def _extract_chapter_refs(question: str) -> set[str]:
     for match in _CHAPTER_REF_RE.finditer(expanded):
         refs.add(match.group(1).lower())
     return refs
+
+
+def _extract_structural_targets(question: str) -> list[tuple[str, set[str]]]:
+    """Extract structural targets from query (titulo/capitulo/secao/subsecao/artigo)."""
+    expanded = _normalize_for_match(normalize_query_numerals(question))
+    targets: list[tuple[str, set[str]]] = []
+    for node_type, pattern in (
+        ("titulo", _TITLE_REF_RE),
+        ("capitulo", _CHAPTER_REF_RE),
+        ("secao", _SECTION_REF_RE),
+        ("subsecao", _SUBSECTION_REF_RE),
+        ("artigo", _ARTICLE_REF_RE),
+    ):
+        refs: set[str] = set()
+        for match in pattern.finditer(expanded):
+            refs.add(match.group(1).lower())
+        if refs:
+            targets.append((node_type, refs))
+    return targets
 
 
 def _extract_chapter_refs_from_text(text: str) -> set[str]:
@@ -157,7 +196,7 @@ def _extract_chapter_refs_from_text(text: str) -> set[str]:
 def _expand_refs_arabic_roman(refs: set[str]) -> set[str]:
     """Expand chapter refs to include both Arabic and Roman numeral forms.
 
-    E.g., {"2"} → {"2", "ii"}, {"ii"} → {"ii", "2"}, {"iv"} → {"iv", "4"}
+    E.g., {"2"} â†’ {"2", "ii"}, {"ii"} â†’ {"ii", "2"}, {"iv"} â†’ {"iv", "4"}
     """
     from src.lexical import _int_to_roman, _roman_to_int
     expanded = set(refs)
@@ -183,6 +222,55 @@ def _item_matches_chapter_refs(item: dict, refs: set[str]) -> bool:
     item_refs = _expand_refs_arabic_roman(_extract_chapter_refs_from_text(structural))
     expanded_refs = _expand_refs_arabic_roman(refs)
     return bool(item_refs & expanded_refs)
+
+
+def _extract_refs_from_meta_value(value: str) -> set[str]:
+    return _expand_refs_arabic_roman(_extract_chapter_refs_from_text(value))
+
+
+def _extract_node_refs_from_text(value: str, node_type: str) -> set[str]:
+    normalized = _normalize_for_match(normalize_query_numerals(value))
+    if node_type == "artigo":
+        return set(re.findall(r"\b\d{1,4}\b", normalized))
+    pattern = _STRUCTURAL_LABEL_REF_RE.get(node_type)
+    refs: set[str] = set()
+    if pattern:
+        for match in pattern.finditer(normalized):
+            refs.add(match.group(1).lower())
+    return _expand_refs_arabic_roman(refs)
+
+
+def _item_matches_structural_target(item: dict, node_type: str, refs: set[str]) -> bool:
+    if not refs:
+        return False
+    meta = item.get("metadata", {}) or {}
+    keys = _NODE_META_KEYS.get(node_type, ())
+    expanded_refs = _expand_refs_arabic_roman(refs)
+    for key in keys:
+        value = str(meta.get(key, "")).strip()
+        if not value:
+            continue
+        if node_type == "artigo":
+            value_tokens = set(re.findall(r"\d{1,4}", _normalize_for_match(value)))
+            if value_tokens & expanded_refs:
+                return True
+            continue
+        meta_refs = _extract_node_refs_from_text(value, node_type)
+        if meta_refs & expanded_refs:
+            return True
+        # Robust fallback: some OCR/parsing variants may corrupt labels
+        # (e.g., "CAPÃTULO"), but numerals still survive.
+        generic_num_tokens = set(
+            re.findall(r"\b(?:[ivxlcdm]+|\d{1,4})\b", _normalize_for_match(value))
+        )
+        if _expand_refs_arabic_roman(generic_num_tokens) & expanded_refs:
+            return True
+    structural = _metadata_structural_text(meta)
+    if structural:
+        structural_refs = _extract_refs_from_meta_value(structural)
+        if structural_refs & expanded_refs:
+            return True
+    return False
 
 
 def _expand_exact_chapter_context(
@@ -312,11 +400,18 @@ def _enforce_summary_structural_scope(
     question: str,
     min_hits: int = 1,
 ) -> tuple[list[dict], bool]:
-    """Keep only chunks that match the exact requested chapter/section reference."""
-    refs = _extract_chapter_refs(question)
-    if not refs:
+    """Keep only chunks that match the requested structural target."""
+    targets = _extract_structural_targets(question)
+    if not targets:
+        refs = _extract_chapter_refs(question)
+        targets = [("capitulo", refs)] if refs else []
+    if not targets:
         return results, False
-    matched = [item for item in results if _item_matches_chapter_refs(item, refs)]
+    matched = [
+        item
+        for item in results
+        if any(_item_matches_structural_target(item, node_type, refs) for node_type, refs in targets)
+    ]
     if len(matched) < min_hits:
         return results, False
     matched = sorted(matched, key=lambda x: x.get("score", 0.0), reverse=True)
@@ -331,9 +426,13 @@ def _metadata_structural_scope_from_seed(
     max_docs: int = 3,
     max_items: int = 80,
 ) -> list[dict]:
-    """Resolve chapter scope directly from chunk metadata for top seeded documents."""
-    refs = _extract_chapter_refs(question)
-    if not refs or not seed_results:
+    """Resolve structural scope directly from metadata for top seeded documents."""
+    targets = _extract_structural_targets(question)
+    if not targets:
+        refs = _extract_chapter_refs(question)
+        if refs:
+            targets = [("capitulo", refs)]
+    if not targets or not seed_results:
         return []
 
     doc_ids: list[str] = []
@@ -358,7 +457,7 @@ def _metadata_structural_scope_from_seed(
         for item in doc_items:
             if item.get("id") in seen_ids:
                 continue
-            if not _item_matches_chapter_refs(item, refs):
+            if not any(_item_matches_structural_target(item, node_type, refs) for node_type, refs in targets):
                 continue
             adjusted = dict(item)
             base = seeded_by_doc.get(doc_id, 0.0)
@@ -560,7 +659,7 @@ def _mark_possible_contradiction(answer_text: str, results: list[dict], question
     return answer_text + note
 
 
-# ── Legal parent expansion ───────────────────────────────────────────────────
+# â”€â”€ Legal parent expansion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _expand_legal_context(
     results: list[dict],
@@ -605,7 +704,7 @@ def _expand_legal_context(
     return expanded
 
 
-# ── Query expansion & HyDE ───────────────────────────────────────────────────
+# â”€â”€ Query expansion & HyDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _expand_query_llm(
     question: str,
@@ -657,7 +756,7 @@ def _generate_hypothetical_doc(
         return question
 
 
-# ── Semantic retrieval ────────────────────────────────────────────────────────
+# â”€â”€ Semantic retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _deduplicate_hits(hits: list[dict]) -> list[dict]:
     """Deduplicate vector results by ID, keeping the highest-scored entry."""
@@ -687,7 +786,7 @@ def _vector_retrieve(
     """
     fetch_k = top_k * 3
 
-    # ── Determine queries to run ─────────────────────────────────────────
+    # â”€â”€ Determine queries to run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     queries = [question]
     if getattr(settings, "query_expansion_enabled", False):
         with metrics.time_block("chat.query_expansion"):
@@ -695,7 +794,7 @@ def _vector_retrieve(
 
     search_query = normalize_query_numerals(question)
 
-    # ── Vector search ────────────────────────────────────────────────────
+    # â”€â”€ Vector search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     all_hits: list[dict] = []
     if getattr(settings, "hyde_enabled", False):
         with metrics.time_block("chat.hyde_generation"):
@@ -723,12 +822,12 @@ def _vector_retrieve(
                     vectordb.query(physical_collection, [q_vec], n_results=fetch_k, where=where)
                 )
 
-    # ── Convert distance → score (cosine distance 0-2 → score 0-1) ─────
+    # â”€â”€ Convert distance â†’ score (cosine distance 0-2 â†’ score 0-1) â”€â”€â”€â”€â”€
     for hit in all_hits:
         if "score" not in hit and "distance" in hit:
             hit["score"] = max(0.0, 1.0 - hit["distance"])
 
-    # ── Deduplicate ──────────────────────────────────────────────────────
+    # â”€â”€ Deduplicate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     results = _deduplicate_hits(all_hits)
 
     log_event(
@@ -741,7 +840,7 @@ def _vector_retrieve(
         request_id=request_id,
     )
 
-    # ── Cross-encoder reranking ──────────────────────────────────────────
+    # â”€â”€ Cross-encoder reranking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if getattr(settings, "reranker_enabled", False):
         from src.reranker import rerank as ce_rerank
 
@@ -759,7 +858,7 @@ def _vector_retrieve(
             top_k=reranker_top,
         )
 
-    # ── Structural reranking + threshold ─────────────────────────────────
+    # â”€â”€ Structural reranking + threshold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     results = _rerank_structural_continuity(
         results,
         question=question,
@@ -885,24 +984,24 @@ def _retrieve_with_routing(
     return _merge_structured_vector(structured_results, vector_results, top_k=top_k)
 
 
-# ── Query intent classification (Gap 4) ─────────────────────────────────────
+# â”€â”€ Query intent classification (Gap 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class QueryIntent(Enum):
-    SUMMARY_STRUCTURAL = "summary_structural"  # "resuma o capítulo 2"
-    QUESTION_STRUCTURAL = "question_structural"  # "o que diz o capítulo 2?"
-    QUESTION_FACTUAL = "question_factual"  # "é proibido remunerar?"
+    SUMMARY_STRUCTURAL = "summary_structural"  # "resuma o capÃ­tulo 2"
+    QUESTION_STRUCTURAL = "question_structural"  # "o que diz o capÃ­tulo 2?"
+    QUESTION_FACTUAL = "question_factual"  # "Ã© proibido remunerar?"
     LOCATE_EXCERPT = "locate_excerpt"  # "art. 41"
-    COMPARISON = "comparison"  # "compare capítulo 1 e 2"
+    COMPARISON = "comparison"  # "compare capÃ­tulo 1 e 2"
 
 _SUMMARY_PATTERNS = [
-    re.compile(r"\b(?:resum[aeiou]|sintetiz[ae]|expliq[ue]|descrev[ae]|vis[aã]o\s+(?:geral|executiva))\b", re.IGNORECASE),
+    re.compile(r"\b(?:resum[aeiou]|sintetiz[ae]|expliq[ue]|descrev[ae]|vis[aÃ£]o\s+(?:geral|executiva))\b", re.IGNORECASE),
 ]
 _STRUCTURAL_REF_PATTERNS = [
-    re.compile(r"\b(?:cap[ií]tulo|se[cç][aã]o|t[ií]tulo|parte)\s+[IVXLCDM\d]+", re.IGNORECASE),
+    re.compile(r"\b(?:cap[iÃ­]tulo|se[cÃ§][aÃ£]o|t[iÃ­]tulo|parte)\s+[IVXLCDM\d]+", re.IGNORECASE),
 ]
 _COMPARISON_PATTERNS = [
     re.compile(r"\bcompar[ae]\b", re.IGNORECASE),
-    re.compile(r"\bdiferença\s+entre\b", re.IGNORECASE),
+    re.compile(r"\bdiferenÃ§a\s+entre\b", re.IGNORECASE),
     re.compile(r"\bversus\b|\bvs\.?\b", re.IGNORECASE),
 ]
 
@@ -924,9 +1023,17 @@ def _classify_intent_regex(question: str) -> QueryIntent:
     Priority: summary_structural > comparison > question_structural > locate_excerpt > factual
     """
     q = question.strip()
-    has_summary = any(p.search(q) for p in _SUMMARY_PATTERNS)
-    has_structural_ref = any(p.search(q) for p in _STRUCTURAL_REF_PATTERNS)
-    has_comparison = any(p.search(q) for p in _COMPARISON_PATTERNS)
+    q_norm = _normalize_for_match(q)
+
+    has_summary = bool(
+        re.search(r"\b(resum|sintetiz|explique|descrev|visao\s+(geral|executiva))", q_norm)
+    )
+    has_structural_ref = bool(
+        re.search(r"\b(capitulo|secao|titulo|parte)\s+([ivxlcdm]+|\d{1,4})\b", q_norm)
+    )
+    has_comparison = bool(
+        re.search(r"\b(compar\w*|diferenca\s+entre|versus|vs\.?)\b", q_norm)
+    )
 
     if has_summary and has_structural_ref:
         return QueryIntent.SUMMARY_STRUCTURAL
@@ -940,39 +1047,39 @@ def _classify_intent_regex(question: str) -> QueryIntent:
     return QueryIntent.QUESTION_FACTUAL
 
 
-# ── Embeddings-based intent classifier ─────────────────────────────────────
+# â”€â”€ Embeddings-based intent classifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# Exemplar queries per intent — used as few-shot anchors for similarity
+# Exemplar queries per intent â€” used as few-shot anchors for similarity
 _INTENT_EXEMPLARS: dict[QueryIntent, list[str]] = {
     QueryIntent.SUMMARY_STRUCTURAL: [
-        "Resuma o capítulo II",
-        "Sintetize a seção III",
-        "Visão geral do título I",
-        "Explique o capítulo 3 em linguagem simples",
-        "Faça um resumo executivo do capítulo IV",
+        "Resuma o capÃ­tulo II",
+        "Sintetize a seÃ§Ã£o III",
+        "VisÃ£o geral do tÃ­tulo I",
+        "Explique o capÃ­tulo 3 em linguagem simples",
+        "FaÃ§a um resumo executivo do capÃ­tulo IV",
     ],
     QueryIntent.QUESTION_STRUCTURAL: [
-        "O que diz o capítulo II sobre obrigações?",
-        "Quais são os direitos previstos na seção I?",
-        "O capítulo 5 trata de quê?",
-        "Que artigos estão no título III?",
+        "O que diz o capÃ­tulo II sobre obrigaÃ§Ãµes?",
+        "Quais sÃ£o os direitos previstos na seÃ§Ã£o I?",
+        "O capÃ­tulo 5 trata de quÃª?",
+        "Que artigos estÃ£o no tÃ­tulo III?",
     ],
     QueryIntent.QUESTION_FACTUAL: [
-        "Qual o prazo para pagamento de rescisão?",
-        "É proibido remunerar diretores?",
+        "Qual o prazo para pagamento de rescisÃ£o?",
+        "Ã‰ proibido remunerar diretores?",
         "Quantos membros tem o conselho?",
-        "Qual é o quórum de deliberação?",
+        "Qual Ã© o quÃ³rum de deliberaÃ§Ã£o?",
     ],
     QueryIntent.LOCATE_EXCERPT: [
         "Art. 41",
         "Artigo 15",
-        "Capítulo II",
-        "Seção III",
+        "CapÃ­tulo II",
+        "SeÃ§Ã£o III",
     ],
     QueryIntent.COMPARISON: [
-        "Compare o capítulo 1 e o capítulo 2",
-        "Qual a diferença entre a seção I e a seção II?",
-        "Capítulo III versus capítulo IV",
+        "Compare o capÃ­tulo 1 e o capÃ­tulo 2",
+        "Qual a diferenÃ§a entre a seÃ§Ã£o I e a seÃ§Ã£o II?",
+        "CapÃ­tulo III versus capÃ­tulo IV",
     ],
 }
 
@@ -1037,46 +1144,55 @@ def _resolve_structural_summary(
     collection: str,
     workspace_id: str,
 ) -> dict | None:
-    """Try to resolve a summary_structural query from pre-computed summaries.
-
-    Returns a summary dict if found, None otherwise.
-    """
+    """Resolve summary_structural query with structural-type awareness and quality gating."""
     from src import controlplane
 
-    # Extract chapter/section reference from question
-    refs = _extract_chapter_refs(question)
-    if not refs:
+    targets = _extract_structural_targets(question)
+    if not targets:
+        refs = _extract_chapter_refs(question)
+        if refs:
+            targets = [("capitulo", refs)]
+    if not targets:
         return None
 
-    # Build search variants: Arabic + Roman forms of each ref
-    search_terms = set()
-    for ref in refs:
-        search_terms.add(ref)
-        search_terms.add(ref.upper())
-        # Arabic → Roman
-        if ref.isdigit():
-            from src.lexical import _int_to_roman
-            roman = _int_to_roman(int(ref))
-            search_terms.add(roman)
-        # Roman → Arabic
-        elif ref.upper().isalpha():
-            from src.lexical import _roman_to_int
-            arabic = _roman_to_int(ref.upper())
-            if arabic > 0:
-                search_terms.add(str(arabic))
+    for node_type, refs in targets:
+        search_terms = set()
+        for ref in refs:
+            search_terms.add(ref)
+            search_terms.add(ref.upper())
+            if ref.isdigit():
+                from src.lexical import _int_to_roman
 
-    # Try to find matching summaries
-    for term in search_terms:
-        for node_type in ("capitulo", "secao", "titulo"):
+                search_terms.add(_int_to_roman(int(ref)))
+            elif ref.upper().isalpha():
+                from src.lexical import _roman_to_int
+
+                arabic = _roman_to_int(ref.upper())
+                if arabic > 0:
+                    search_terms.add(str(arabic))
+
+        for term in search_terms:
             summaries = controlplane.find_summaries_by_label(
                 workspace_id=workspace_id,
                 collection=collection,
                 label_query=term,
                 node_type=node_type,
             )
+            summaries = [s for s in summaries if _summary_is_usable(s)]
             if summaries:
-                return summaries[0]
+                chosen = summaries[0]
+                log_event(
+                    logger,
+                    20,
+                    "Pre-computed structural summary resolved",
+                    node_type=node_type,
+                    label=chosen.get("label", ""),
+                    status=chosen.get("status", ""),
+                )
+                metrics.increment("chat.summary.cache_hit")
+                return chosen
 
+    metrics.increment("chat.summary.cache_miss")
     return None
 
 
@@ -1147,11 +1263,250 @@ def _answer_from_summary(
         logger, 20, "Chat answered via pre-computed summary",
         collection=collection, node_id=node_summary.node_id,
         label=node_summary.label, request_id=request_id,
+        status=node_summary.status,
     )
+    metrics.increment(f"chat.summary.answer_from_{node_summary.status or 'unknown'}")
     return ChatResult(answer=answer_text, sources=sources, request_id=request_id)
 
 
-# ── Main answer function ─────────────────────────────────────────────────────
+def _summary_is_usable(summary: dict | None) -> bool:
+    if not summary:
+        return False
+    status = str(summary.get("status", "generated")).lower()
+    if status == "invalid":
+        return False
+    if not (
+        str(summary.get("resumo_executivo", "")).strip()
+        or str(summary.get("resumo_juridico", "")).strip()
+        or summary.get("pontos_chave")
+    ):
+        return False
+    return True
+
+
+def _artifact_candidates(doc_id: str, filename: str) -> list[str]:
+    candidates = [doc_id, Path(doc_id).name, filename, Path(filename).name, Path(filename).stem]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
+
+
+def _resolve_processed_json(doc_id: str, filename: str) -> Path | None:
+    artifacts_dir = Path(get_settings().pdf_pipeline_artifacts_dir)
+    for key in _artifact_candidates(doc_id, filename):
+        path = artifacts_dir / f"{key}.json"
+        if path.exists():
+            return path
+    return None
+
+
+def _artifact_header_level(text: str) -> tuple[str, str] | None:
+    normalized = _normalize_for_match(text)
+    for node_type, prefix in (("titulo", "titulo"), ("capitulo", "capitulo"), ("secao", "secao")):
+        m = re.search(rf"\b{prefix}\s+([ivxlcdm]+|\d{{1,4}})\b", normalized)
+        if m:
+            return node_type, m.group(1)
+    return None
+
+
+def _extract_structural_scope_from_artifact(
+    *,
+    question: str,
+    collection: str,
+    workspace_id: str,
+) -> dict | None:
+    """Read processed JSON artifacts to resolve structural summaries deterministically."""
+    from src import controlplane
+    from src.summaries import generate_summary_from_scope_text
+
+    targets = _extract_structural_targets(question)
+    if not targets:
+        refs = _extract_chapter_refs(question)
+        if refs:
+            targets = [("capitulo", refs)]
+    if not targets:
+        return None
+
+    documents = controlplane.list_documents(workspace_id, collection)
+    for doc in documents:
+        artifact = _resolve_processed_json(doc.doc_id, doc.filename)
+        if not artifact:
+            continue
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        blocks = data.get("blocks", [])
+        if not isinstance(blocks, list) or not blocks:
+            continue
+
+        for node_type, refs in targets:
+            expanded_refs = _expand_refs_arabic_roman(refs)
+            for idx, block in enumerate(blocks):
+                text = str(block.get("text", "")).strip()
+                block_type = str(block.get("block_type", "")).strip().lower()
+                if block_type not in {"section_header", "title", "header", "body"}:
+                    continue
+                header = _artifact_header_level(text)
+                if not header or header[0] != node_type:
+                    continue
+                if not (_expand_refs_arabic_roman({header[1]}) & expanded_refs):
+                    continue
+
+                parts = [text]
+                articles: list[str] = []
+                current_level = {"titulo": 1, "capitulo": 2, "secao": 3}.get(node_type, 3)
+                for next_block in blocks[idx + 1:]:
+                    next_text = str(next_block.get("text", "")).strip()
+                    next_header = _artifact_header_level(next_text)
+                    if next_header:
+                        next_level = {"titulo": 1, "capitulo": 2, "secao": 3}.get(next_header[0], 99)
+                        if next_level <= current_level:
+                            break
+                    if next_text:
+                        parts.append(next_text)
+                        articles.extend(re.findall(r"Art\.?\s*(\d+)", next_text, re.IGNORECASE))
+
+                merged = "\n\n".join(parts).strip()
+                if not merged:
+                    continue
+                summary = generate_summary_from_scope_text(
+                    node_id=f"artifact::{doc.doc_id}::{node_type}::{header[1]}",
+                    node_type=node_type,
+                    label=text.splitlines()[0].strip(),
+                    path=text.splitlines()[0].strip(),
+                    text=merged,
+                    articles=articles,
+                )
+                out = summary.to_dict()
+                out["doc_id"] = doc.doc_id
+                log_event(
+                    logger,
+                    20,
+                    "Structural summary resolved from processed artifact",
+                    request_id="-",
+                    collection=collection,
+                    doc_id=doc.doc_id,
+                    node_type=node_type,
+                    label=out.get("label", ""),
+                )
+                metrics.increment("chat.summary.artifact_hit")
+                return out
+    return None
+
+
+def _build_on_demand_summary_from_scope(
+    *,
+    question: str,
+    scoped_results: list[dict],
+    request_id: str,
+    workspace_id: str,
+    collection: str,
+) -> dict | None:
+    """Build summary on demand from already scoped chunks when cache is missing."""
+    if not scoped_results:
+        return None
+
+    from src.summaries import generate_summary_from_scope_text
+
+    ordered = sorted(
+        scoped_results,
+        key=lambda x: (
+            x.get("metadata", {}).get("page_number", 10**9),
+            x.get("metadata", {}).get("chunk_index", 10**9),
+        ),
+    )
+    selected = ordered[:24]
+    merged_text = "\n\n".join(str(item.get("text", "")).strip() for item in selected if str(item.get("text", "")).strip())
+    if not merged_text.strip():
+        return None
+
+    anchor_meta = selected[0].get("metadata", {}) if selected else {}
+    targets = _extract_structural_targets(question)
+    node_type = targets[0][0] if targets else "capitulo"
+    label = (
+        str(anchor_meta.get(node_type, "")).strip()
+        or str(anchor_meta.get("caminho_hierarquico", "")).strip()
+        or f"Escopo {node_type}"
+    )
+    path = str(anchor_meta.get("caminho_hierarquico", "")).strip() or label
+    node_id = str(anchor_meta.get("node_id", "")).strip() or f"on_demand::{hash(label + path) & 0xFFFFFFFF:08x}"
+    article_values: list[str] = []
+    for item in selected:
+        art = str(item.get("metadata", {}).get("artigo", "")).strip()
+        if art and art not in article_values:
+            article_values.append(art)
+
+    with metrics.time_block("chat.summary.on_demand_generation"):
+        summary = generate_summary_from_scope_text(
+            node_id=node_id,
+            node_type=node_type,
+            label=label,
+            path=path,
+            text=merged_text,
+            articles=article_values,
+        )
+    metrics.increment("chat.summary.fallback_used")
+
+    data = summary.to_dict()
+    if data.get("status") == "invalid":
+        log_event(
+            logger,
+            30,
+            "On-demand structural summary invalid",
+            request_id=request_id,
+            node_type=node_type,
+            label=label,
+            errors=data.get("validation_errors", []),
+        )
+        return None
+
+    log_event(
+        logger,
+        20,
+        "On-demand structural summary generated",
+        request_id=request_id,
+        node_type=node_type,
+        label=label,
+        scoped_chunks=len(selected),
+    )
+    doc_id = str(anchor_meta.get("doc_id", "")).strip()
+    if doc_id:
+        from src import controlplane
+        controlplane.upsert_document_summary(
+            workspace_id=workspace_id,
+            collection=collection,
+            doc_id=doc_id,
+            node_id=data.get("node_id", node_id),
+            node_type=data.get("node_type", node_type),
+            label=data.get("label", label),
+            path=data.get("path", path),
+            resumo_executivo=data.get("resumo_executivo", ""),
+            resumo_juridico=data.get("resumo_juridico", ""),
+            pontos_chave=data.get("pontos_chave", []),
+            artigos_cobertos=data.get("artigos_cobertos", []),
+            obrigacoes=data.get("obrigacoes", []),
+            restricoes=data.get("restricoes", []),
+            definicoes=data.get("definicoes", []),
+            text_length=int(data.get("text_length", len(merged_text))),
+            source_hash=str(data.get("source_hash", "")),
+            source_text_length=int(data.get("source_text_length", len(merged_text))),
+            status="fallback_only",
+            invalid_reason="",
+            generation_meta=data.get("generation_meta", {}),
+        )
+        metrics.increment("chat.summary.persisted_from_fallback")
+
+    return data
+
+
+# â”€â”€ Main answer function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def answer(
     collection: str,
@@ -1169,7 +1524,7 @@ def answer(
     profile_name = domain_profile or settings.default_domain_profile
     physical_collection = vectordb.resolve_query_collection(collection, model_name, workspace_id=workspace_id)
 
-    # ── Guardrails ────────────────────────────────────────────────
+    # â”€â”€ Guardrails â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     question = sanitize_question(question)
     history = sanitize_history(history or [])
 
@@ -1177,19 +1532,19 @@ def answer(
     if injection:
         log_event(logger, 30, "Prompt injection detected in question", pattern=injection, request_id=request_id)
         return ChatResult(
-            answer="Não foi possível processar essa pergunta. Reformule sua solicitação.",
+            answer="NÃ£o foi possÃ­vel processar essa pergunta. Reformule sua solicitaÃ§Ã£o.",
             sources=[],
             request_id=request_id,
         )
 
-    # ── Intent classification + summary shortcut ──────────────────
+    # â”€â”€ Intent classification + summary shortcut â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified", intent=intent.value, request_id=request_id)
     metrics.increment(f"chat.intent.{intent.value}")
 
     if intent == QueryIntent.SUMMARY_STRUCTURAL:
         summary = _resolve_structural_summary(question, collection, workspace_id)
-        if summary:
+        if _summary_is_usable(summary):
             log_event(logger, 20, "Summary structural shortcut activated",
                       label=summary.get("label", ""), request_id=request_id)
             return _answer_from_summary(
@@ -1203,6 +1558,39 @@ def answer(
                 workspace_id=workspace_id,
                 model_name=model_name,
             )
+        artifact_summary = _extract_structural_scope_from_artifact(
+            question=question,
+            collection=collection,
+            workspace_id=workspace_id,
+        )
+        if _summary_is_usable(artifact_summary):
+            log_event(
+                logger,
+                20,
+                "Summary structural resolved from processed artifact",
+                request_id=request_id,
+                label=artifact_summary.get("label", ""),
+            )
+            return _answer_from_summary(
+                summary=artifact_summary,
+                question=question,
+                history=history,
+                request_id=request_id,
+                profile_name=profile_name,
+                collection=collection,
+                physical_collection=physical_collection,
+                workspace_id=workspace_id,
+                model_name=model_name,
+            )
+        if summary and not _summary_is_usable(summary):
+            log_event(
+                logger,
+                30,
+                "Pre-computed summary ignored due to invalid/empty payload",
+                request_id=request_id,
+                label=summary.get("label", ""),
+                status=summary.get("status", ""),
+            )
         log_event(
             logger,
             20,
@@ -1210,7 +1598,7 @@ def answer(
             request_id=request_id,
         )
 
-    # ── Retrieval ─────────────────────────────────────────────────
+    # â”€â”€ Retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     fused = _retrieve_with_routing(
         question=question,
         collection=collection,
@@ -1247,12 +1635,12 @@ def answer(
             request_id=request_id,
         )
         return ChatResult(
-            answer="Não encontrei informações relevantes nos documentos disponíveis para essa coleção.",
+            answer="NÃ£o encontrei informaÃ§Ãµes relevantes nos documentos disponÃ­veis para essa coleÃ§Ã£o.",
             sources=[],
             request_id=request_id,
         )
 
-    # ── Parent expansion for legal chunks ─────────────────────────
+    # â”€â”€ Parent expansion for legal chunks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     max_exp = int(settings.max_context_tokens * 0.4)
     fused = _expand_legal_context(
         fused, physical_collection,
@@ -1289,12 +1677,51 @@ def answer(
             )
         else:
             return ChatResult(
-                answer="Nao localizei trechos suficientes do capitulo solicitado nos documentos desta colecao.",
+                answer="Nao localizei trechos suficientes da estrutura solicitada (titulo/capitulo/secao/artigo) nos documentos desta colecao.",
                 sources=[],
                 request_id=request_id,
             )
+        ondemand_summary = _build_on_demand_summary_from_scope(
+            question=question,
+            scoped_results=fused,
+            request_id=request_id,
+            workspace_id=workspace_id,
+            collection=collection,
+        )
+        if ondemand_summary:
+            result = _answer_from_summary(
+                summary=ondemand_summary,
+                question=question,
+                history=history,
+                request_id=request_id,
+                profile_name=profile_name,
+                collection=collection,
+                physical_collection=physical_collection,
+                workspace_id=workspace_id,
+                model_name=model_name,
+            )
+            return result
+        ondemand_summary = _build_on_demand_summary_from_scope(
+            question=question,
+            scoped_results=fused,
+            request_id=request_id,
+            workspace_id=workspace_id,
+            collection=collection,
+        )
+        if ondemand_summary:
+            return _answer_from_summary(
+                summary=ondemand_summary,
+                question=question,
+                history=history,
+                request_id=request_id,
+                profile_name=profile_name,
+                collection=collection,
+                physical_collection=physical_collection,
+                workspace_id=workspace_id,
+                model_name=model_name,
+            )
 
-    # ── Sanitize + compress + trim + format ────────────────────────
+    # â”€â”€ Sanitize + compress + trim + format â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for item in fused:
         item["text"] = sanitize_context_chunk(item["text"])
 
@@ -1313,7 +1740,7 @@ def answer(
     context_tokens = _estimate_tokens(context, settings.chars_per_token)
     metrics.observe("chat.context_tokens", context_tokens)
 
-    # ── LLM generation ────────────────────────────────────────────
+    # â”€â”€ LLM generation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     messages: list[dict] = [{"role": msg.role, "content": msg.content} for msg in history]
     messages.extend(build_rag_messages(context=context, question=question))
 
@@ -1343,11 +1770,11 @@ def answer(
     return ChatResult(answer=answer_text, sources=sources, request_id=request_id)
 
 
-# ── Streaming ────────────────────────────────────────────────────────────────
+# â”€â”€ Streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class StreamContext:
-    """Holds retrieval results for streaming — sources are sent before the LLM tokens."""
+    """Holds retrieval results for streaming â€” sources are sent before the LLM tokens."""
     sources: list[Source]
     request_id: str
     messages: list[dict]
@@ -1377,19 +1804,19 @@ def prepare_stream(
     if injection:
         log_event(logger, 30, "Prompt injection detected in question", pattern=injection, request_id=request_id)
         return ChatResult(
-            answer="Não foi possível processar essa pergunta. Reformule sua solicitação.",
+            answer="NÃ£o foi possÃ­vel processar essa pergunta. Reformule sua solicitaÃ§Ã£o.",
             sources=[],
             request_id=request_id,
         )
 
-    # ── Intent classification + summary shortcut for streaming ────
+    # â”€â”€ Intent classification + summary shortcut for streaming â”€â”€â”€â”€
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified",
               intent=intent.value, request_id=request_id)
 
     if intent == QueryIntent.SUMMARY_STRUCTURAL:
         summary = _resolve_structural_summary(question, collection, workspace_id)
-        if summary:
+        if _summary_is_usable(summary):
             log_event(logger, 20, "Summary structural shortcut activated",
                       label=summary.get("label", ""), request_id=request_id)
             result = _answer_from_summary(
@@ -1404,6 +1831,40 @@ def prepare_stream(
                 model_name=model_name,
             )
             return result
+        artifact_summary = _extract_structural_scope_from_artifact(
+            question=question,
+            collection=collection,
+            workspace_id=workspace_id,
+        )
+        if _summary_is_usable(artifact_summary):
+            log_event(
+                logger,
+                20,
+                "Streaming summary structural resolved from processed artifact",
+                request_id=request_id,
+                label=artifact_summary.get("label", ""),
+            )
+            result = _answer_from_summary(
+                summary=artifact_summary,
+                question=question,
+                history=history,
+                request_id=request_id,
+                profile_name=profile_name,
+                collection=collection,
+                physical_collection=physical_collection,
+                workspace_id=workspace_id,
+                model_name=model_name,
+            )
+            return result
+        if summary and not _summary_is_usable(summary):
+            log_event(
+                logger,
+                30,
+                "Pre-computed summary ignored due to invalid/empty payload",
+                request_id=request_id,
+                label=summary.get("label", ""),
+                status=summary.get("status", ""),
+            )
         log_event(
             logger,
             20,
@@ -1441,7 +1902,7 @@ def prepare_stream(
 
     if not fused:
         return ChatResult(
-            answer="Não encontrei informações relevantes nos documentos disponíveis para essa coleção.",
+            answer="NÃ£o encontrei informaÃ§Ãµes relevantes nos documentos disponÃ­veis para essa coleÃ§Ã£o.",
             sources=[],
             request_id=request_id,
         )
@@ -1483,7 +1944,7 @@ def prepare_stream(
             )
         else:
             return ChatResult(
-                answer="Nao localizei trechos suficientes do capitulo solicitado nos documentos desta colecao.",
+                answer="Nao localizei trechos suficientes da estrutura solicitada (titulo/capitulo/secao/artigo) nos documentos desta colecao.",
                 sources=[],
                 request_id=request_id,
             )
@@ -1524,3 +1985,4 @@ def prepare_stream(
         messages=messages,
         system=get_rag_system(profile_name),
     )
+

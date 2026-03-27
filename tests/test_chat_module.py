@@ -1,4 +1,6 @@
 from src import chat
+from pathlib import Path
+import json
 
 
 def _settings(**overrides):
@@ -200,6 +202,17 @@ def test_enforce_summary_structural_scope_keeps_only_requested_chapter():
     assert {i["id"] for i in scoped} == {"cap-ii-a", "cap-ii-b"}
 
 
+def test_enforce_summary_structural_scope_keeps_only_requested_section():
+    items = [
+        {"id": "sec-i", "text": "Art. 1", "score": 0.9, "metadata": {"secao": "SECAO I - GERAL"}},
+        {"id": "sec-iii-a", "text": "Art. 8", "score": 0.7, "metadata": {"secao": "SECAO III - PENALIDADES"}},
+        {"id": "sec-iii-b", "text": "Art. 9", "score": 0.65, "metadata": {"secao": "SECAO III - PENALIDADES"}},
+    ]
+    scoped, ok = chat._enforce_summary_structural_scope(items, "Explique a secao III", min_hits=1)
+    assert ok is True
+    assert {i["id"] for i in scoped} == {"sec-iii-a", "sec-iii-b"}
+
+
 def test_metadata_structural_scope_from_seed_uses_doc_metadata(monkeypatch):
     seed = [
         {"id": "v1", "text": "hit", "score": 0.6, "metadata": {"doc_id": "estatuto.pdf", "capitulo": "CAPÍTULO V"}},
@@ -219,6 +232,68 @@ def test_metadata_structural_scope_from_seed_uses_doc_metadata(monkeypatch):
     )
     ids = [item["id"] for item in scoped]
     assert ids == ["ii-1", "ii-2"]
+
+
+def test_build_on_demand_summary_from_scope_returns_none_when_empty():
+    result = chat._build_on_demand_summary_from_scope(
+        question="Resuma o capitulo 2",
+        scoped_results=[],
+        request_id="req-1",
+        workspace_id="default",
+        collection="col",
+    )
+    assert result is None
+
+
+def test_extract_structural_scope_from_artifact(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPÍTULO I - DAS CARACTERÍSTICAS"},
+            {"block_type": "body", "text": "Art. 1º - A cooperativa tem sede em Porto Alegre."},
+            {"block_type": "body", "text": "Art. 2º - O prazo de duração é indeterminado."},
+            {"block_type": "section_header", "text": "CAPÍTULO II - DOS OBJETIVOS SOCIAIS"},
+            {"block_type": "body", "text": "Art. 3º - A cooperativa objetiva promover o desenvolvimento."},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: type("S", (), {"pdf_pipeline_artifacts_dir": str(artifacts)})())
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr(
+        "src.summaries.generate_summary_from_scope_text",
+        lambda **kwargs: type("Summary", (), {"to_dict": lambda self: {
+            "node_id": "x",
+            "node_type": "capitulo",
+            "label": kwargs["label"],
+            "path": kwargs["path"],
+            "resumo_executivo": "Resumo do capítulo I",
+            "resumo_juridico": "",
+            "pontos_chave": [],
+            "artigos_cobertos": [],
+            "obrigacoes": [],
+            "restricoes": [],
+            "definicoes": [],
+            "text_length": len(kwargs["text"]),
+            "source_hash": "",
+            "source_text_length": len(kwargs["text"]),
+            "status": "fallback_only",
+            "validation_errors": [],
+            "generation_meta": {},
+        }})(),
+    )
+    summary = chat._extract_structural_scope_from_artifact(
+        question="Resuma o capitulo 1",
+        collection="teste",
+        workspace_id="default",
+    )
+    assert summary is not None
+    assert "CAPÍTULO I" in summary["label"]
 
 
 def test_answer_returns_direct_message_when_no_results(monkeypatch):

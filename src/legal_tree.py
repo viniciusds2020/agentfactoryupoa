@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,6 +53,12 @@ _STRUCTURAL_NUM_RE = re.compile(
 )
 
 
+def _normalize_structural_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.replace("–", "-").replace("—", "-")
+
+
 def _extract_numeral(header: str) -> str:
     """Extract the numeral (Roman or Arabic) from a structural header.
 
@@ -59,6 +66,12 @@ def _extract_numeral(header: str) -> str:
     avoiding false matches on letters within the keyword itself.
     """
     m = _STRUCTURAL_NUM_RE.search(header)
+    if not m:
+        m = re.search(
+            r"(?:TITULO|CAPITULO|SECAO)\s+([IVXLCDM]+|\d+)",
+            _normalize_structural_text(header),
+            re.IGNORECASE,
+        )
     return m.group(1).upper() if m else ""
 
 
@@ -168,6 +181,23 @@ def _find_all_matches(pattern: re.Pattern, text: str) -> list[tuple[int, str]]:
     return [(m.start(), m.group(1).strip()) for m in pattern.finditer(text)]
 
 
+def _find_structural_markers_fallback(text: str) -> list[tuple[int, str, str]]:
+    """Fallback line-based marker detection for OCR/encoding-noisy headings."""
+    markers: list[tuple[int, str, str]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        normalized = _normalize_structural_text(stripped).upper()
+        if re.match(r"^TITULO\s+([IVXLCDM]+|\d+)\b", normalized):
+            markers.append((offset, "titulo", stripped))
+        elif re.match(r"^CAPITULO\s+([IVXLCDM]+|\d+)\b", normalized):
+            markers.append((offset, "capitulo", stripped))
+        elif re.match(r"^SECAO\s+([IVXLCDM]+|\d+)\b", normalized):
+            markers.append((offset, "secao", stripped))
+        offset += len(line)
+    return markers
+
+
 def _text_between(text: str, start: int, end: int) -> str:
     """Extract and clean text between two offsets."""
     return text[start:end].strip()
@@ -207,7 +237,18 @@ def build_legal_tree(text: str, doc_id: str, doc_name: str = "") -> LegalTree:
         markers.append((offset, "capitulo", header))
     for offset, header in secoes:
         markers.append((offset, "secao", header))
+    if not markers:
+        markers.extend(_find_structural_markers_fallback(text))
     markers.sort(key=lambda x: x[0])
+    deduped: list[tuple[int, str, str]] = []
+    seen_marker_keys: set[tuple[int, str]] = set()
+    for marker in markers:
+        key = (marker[0], marker[1])
+        if key in seen_marker_keys:
+            continue
+        seen_marker_keys.add(key)
+        deduped.append(marker)
+    markers = deduped
 
     node_index: dict[str, LegalNode] = {}
 
