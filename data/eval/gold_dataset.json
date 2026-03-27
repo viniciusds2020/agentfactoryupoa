@@ -1,0 +1,251 @@
+{
+  "corpus": [
+    {"id": "c1", "text": "O prazo para pagamento de rescisao e de 10 dias uteis conforme Art. 477 da CLT."},
+    {"id": "c2", "text": "Ferias proporcionais devem ser pagas na rescisao do contrato de trabalho."},
+    {"id": "c3", "text": "O FGTS deve ser depositado ate o dia 7 do mes seguinte ao trabalhado."},
+    {"id": "c4", "text": "O aviso previo pode ser trabalhado ou indenizado, conforme escolha do empregador."},
+    {"id": "c5", "text": "A jornada de trabalho padrao e de 8 horas diarias e 44 horas semanais."},
+    {"id": "c6", "text": "O salario minimo e reajustado anualmente pelo governo federal."},
+    {"id": "c7", "text": "O contrato de experiencia tem prazo maximo de 90 dias."},
+    {"id": "c8", "text": "O decimo terceiro salario e pago em duas parcelas anuais."},
+    {"id": "c9", "text": "A licenca-maternidade tem duracao de 120 dias, podendo ser estendida para 180 dias."},
+    {"id": "c10", "text": "Horas extras devem ser remuneradas com adicional minimo de 50% sobre a hora normal."},
+    {"id": "c11", "text": "O empregado tem direito a 30 dias de ferias apos cada periodo de 12 meses de trabalho."},
+    {"id": "c12", "text": "O adicional noturno e de no minimo 20% sobre a hora diurna, para trabalho entre 22h e 5h."},
+    {"id": "c13", "text": "A estabilidade provisoria da gestante vai da confirmacao da gravidez ate 5 meses apos o parto."},
+    {"id": "c14", "text": "O vale-transporte e obrigatorio e o empregador pode descontar ate 6% do salario base."},
+    {"id": "c15", "text": "A multa rescisoria do FGTS e de 40% sobre o saldo da conta vinculada em caso de demissao sem justa causa."},
+    {"id": "c16", "text": "O intervalo intrajornada para jornadas acima de 6 horas deve ser de no minimo 1 hora."},
+    {"id": "c17", "text": "O salario-familia e pago aos empregados de baixa renda que possuam filhos de ate 14 anos."},
+    {"id": "c18", "text": "A clausula de nao concorrencia deve prever compensacao financeira adequada e prazo maximo de 2 anos."},
+    {"id": "c19", "text": "O contrato de prestacao de servicos deve especificar objeto, prazo, valor e condicoes de rescisao."},
+    {"id": "c20", "text": "A multa contratual por descumprimento de clausula deve ser proporcional ao dano causado."},
+    {"id": "c21", "text": "O prazo prescricional para acoes trabalhistas e de 5 anos durante o contrato e 2 anos apos a rescisao."},
+    {"id": "c22", "text": "O banco de horas permite compensar horas extras com folgas, mediante acordo individual ou coletivo."},
+    {"id": "c23", "text": "A CIPA deve ser constituida por empresas com mais de 20 empregados, conforme NR-5."},
+    {"id": "c24", "text": "O adicional de insalubridade varia de 10%, 20% ou 40% do salario minimo conforme o grau de exposicao."},
+    {"id": "c25", "text": "A convencao coletiva de trabalho tem validade maxima de 2 anos e prevalece sobre a lei em materias especificas."},
+    {"id": "c26", "text": "O teletrabalho deve ser formalizado em contrato individual com previsao de custos de infraestrutura."},
+    {"id": "c27", "text": "A licenca-paternidade e de 5 dias corridos, podendo ser estendida para 20 dias em empresas do Programa Empresa Cidada."},
+    {"id": "c28", "text": "O contrato por prazo determinado so e valido para servico cuja natureza justifique a predeterminacao do prazo."},
+    {"id": "c29", "text": "A rescisao indireta ocorre quando o empregador comete falta grave, conforme Art. 483 da CLT."},
+    {"id": "c30", "text": "O seguro-desemprego e pago em 3 a 5 parcelas dependendo do tempo de trabalho nos ultimos 36 meses."},
+    {"id": "c31", "text": "A clausula penal em contratos civis nao pode exceder o valor da obrigacao principal conforme Art. 412 do Codigo Civil."},
+    {"id": "c32", "text": "O prazo de vigencia de contratos administrativos e de ate 5 anos para servicos continuados."},
+    {"id": "c33", "text": "A responsabilidade solidaria entre empresas do mesmo grupo economico esta prevista no Art. 2, par. 2 da CLT."},
+    {"id": "c34", "text": "O empregado eleito para cargo de direcao sindical tem estabilidade desde o registro da candidatura ate 1 ano apos o mandato."},
+    {"id": "c35", "text": "A participacao nos lucros e resultados (PLR) nao tem natureza salarial e deve ser negociada via acordo coletivo."}
+  ],
+  "queries": [
+    {
+      "question": "Qual o prazo para pagar rescisao?",
+      "relevant": ["c1"],
+      "partially_relevant": ["c2"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Como funciona o deposito do FGTS?",
+      "relevant": ["c3"],
+      "partially_relevant": ["c15"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Quanto tempo dura o contrato de experiencia?",
+      "relevant": ["c7"],
+      "partially_relevant": ["c28"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Quando e pago o decimo terceiro?",
+      "relevant": ["c8"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Qual o adicional de hora extra?",
+      "relevant": ["c10"],
+      "partially_relevant": ["c22"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Quantos dias de ferias o trabalhador tem direito?",
+      "relevant": ["c11"],
+      "partially_relevant": ["c2"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Qual o percentual do adicional noturno?",
+      "relevant": ["c12"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Gestante pode ser demitida?",
+      "relevant": ["c13"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Como funciona o vale-transporte?",
+      "relevant": ["c14"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Qual o valor da multa do FGTS na demissao sem justa causa?",
+      "relevant": ["c15"],
+      "partially_relevant": ["c3"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Qual o intervalo minimo para almoco?",
+      "relevant": ["c16"],
+      "partially_relevant": ["c5"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Quem tem direito ao salario-familia?",
+      "relevant": ["c17"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Clausula de nao concorrencia precisa de compensacao?",
+      "relevant": ["c18"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "O que deve constar no contrato de prestacao de servicos?",
+      "relevant": ["c19"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Multa contratual pode ser qualquer valor?",
+      "relevant": ["c20"],
+      "partially_relevant": ["c31"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Qual o prazo para entrar com acao trabalhista?",
+      "relevant": ["c21"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Como funciona banco de horas?",
+      "relevant": ["c22"],
+      "partially_relevant": ["c10"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Quando a empresa precisa ter CIPA?",
+      "relevant": ["c23"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Quanto paga de insalubridade?",
+      "relevant": ["c24"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Convencao coletiva pode mudar a lei?",
+      "relevant": ["c25"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Precisa de contrato para home office?",
+      "relevant": ["c26"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Quantos dias de licenca-paternidade?",
+      "relevant": ["c27"],
+      "partially_relevant": ["c9"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "aviso previo indenizado",
+      "relevant": ["c4"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "jornada semanal CLT",
+      "relevant": ["c5"],
+      "partially_relevant": ["c16"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "reajuste salario",
+      "relevant": ["c6"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "licenca maternidade dias",
+      "relevant": ["c9"],
+      "partially_relevant": ["c27"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "O que e rescisao indireta?",
+      "relevant": ["c29"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Quantas parcelas de seguro-desemprego?",
+      "relevant": ["c30"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Limite da clausula penal em contrato",
+      "relevant": ["c31"],
+      "partially_relevant": ["c20"],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Prazo maximo de contrato administrativo",
+      "relevant": ["c32"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Empresa do mesmo grupo responde pela divida trabalhista?",
+      "relevant": ["c33"],
+      "partially_relevant": [],
+      "query_type": "semantic"
+    },
+    {
+      "question": "Dirigente sindical pode ser demitido?",
+      "relevant": ["c34"],
+      "partially_relevant": ["c13"],
+      "query_type": "semantic"
+    },
+    {
+      "question": "PLR tem natureza salarial?",
+      "relevant": ["c35"],
+      "partially_relevant": [],
+      "query_type": "keyword"
+    },
+    {
+      "question": "Quais sao os direitos na demissao sem justa causa?",
+      "relevant": ["c1", "c15", "c30"],
+      "partially_relevant": ["c2", "c4"],
+      "query_type": "mixed"
+    },
+    {
+      "question": "Quais tipos de estabilidade existem?",
+      "relevant": ["c13", "c34"],
+      "partially_relevant": [],
+      "query_type": "mixed"
+    }
+  ]
+}

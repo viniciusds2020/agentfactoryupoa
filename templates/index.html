@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Factory</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  .msg-md p { margin: 0.4em 0; }
+  .msg-md ul, .msg-md ol { margin: 0.3em 0 0.3em 1.2em; }
+  .msg-md code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }
+  .msg-md pre { background: #f3f4f6; padding: 0.6em; border-radius: 6px; overflow-x: auto; }
+  .source-badge { font-size: 0.7rem; }
+  .drop-active { border-color: #6366f1 !important; background: #eef2ff !important; }
+  #sidebar::-webkit-scrollbar, #messages::-webkit-scrollbar { width: 4px; }
+  #sidebar::-webkit-scrollbar-thumb, #messages::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 2px; }
+</style>
+</head>
+<body class="h-screen flex bg-gray-50 text-gray-800">
+
+<!-- Sidebar -->
+<aside id="sidebar" class="w-64 bg-white border-r border-gray-200 flex flex-col shrink-0 overflow-y-auto">
+  <div class="p-4 border-b border-gray-100">
+    <h1 class="text-lg font-semibold text-indigo-700">Agent Factory</h1>
+    <p class="text-xs text-gray-400 mt-0.5">Pergunte sobre seus documentos</p>
+  </div>
+
+  <div class="p-3">
+    <button onclick="newConversation()" class="w-full py-2 px-3 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition">
+      + Nova conversa
+    </button>
+  </div>
+
+  <!-- Collection selector (hidden until 2+) -->
+  <div id="collection-section" class="px-3 pb-2 hidden">
+    <label class="text-xs text-gray-500 block mb-1">Pasta de documentos</label>
+    <select id="collection-select" onchange="switchCollection()" class="w-full text-sm border border-gray-200 rounded-md px-2 py-1.5 focus:ring-1 focus:ring-indigo-400 outline-none"></select>
+  </div>
+
+  <!-- Conversations list -->
+  <div class="flex-1 px-3 pb-3">
+    <p class="text-xs text-gray-400 mb-2">Conversas recentes</p>
+    <div id="conv-list" class="space-y-1"></div>
+  </div>
+
+  <!-- Upload area -->
+  <div class="p-3 border-t border-gray-100">
+    <div id="drop-zone"
+         class="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center cursor-pointer hover:border-indigo-400 transition"
+         onclick="document.getElementById('file-input').click()">
+      <input type="file" id="file-input" class="hidden" accept=".pdf,.docx,.txt,.md" onchange="uploadFile(this.files[0])">
+      <p class="text-sm text-gray-500">Enviar documento</p>
+      <p class="text-xs text-gray-400 mt-1">PDF, DOCX, TXT ou MD</p>
+    </div>
+    <div id="upload-status" class="mt-2 text-xs hidden"></div>
+    <div id="doc-list" class="mt-2 space-y-1"></div>
+  </div>
+</aside>
+
+<!-- Main chat -->
+<main class="flex-1 flex flex-col min-w-0">
+  <!-- Messages -->
+  <div id="messages" class="flex-1 overflow-y-auto p-6 space-y-4">
+    <div id="welcome" class="flex items-center justify-center h-full">
+      <div class="text-center max-w-md">
+        <div class="text-5xl mb-4">📄</div>
+        <h2 class="text-xl font-semibold text-gray-700 mb-2">Bem-vindo ao Agent Factory</h2>
+        <p class="text-gray-500 text-sm">Envie um documento pela barra lateral e depois faça perguntas sobre ele.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="border-t border-gray-200 bg-white p-4">
+    <form onsubmit="sendMessage(event)" class="flex gap-3 max-w-4xl mx-auto">
+      <textarea id="question" rows="1" placeholder="Digite sua pergunta..."
+                class="flex-1 resize-none border border-gray-300 rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-indigo-400 outline-none"
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){sendMessage(event)}"></textarea>
+      <button type="submit" id="send-btn"
+              class="px-5 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-40 transition text-sm font-medium">
+        Enviar
+      </button>
+    </form>
+  </div>
+</main>
+
+<script>
+const DEFAULT_COLLECTION = "{{ default_collection }}";
+let currentCollection = DEFAULT_COLLECTION;
+let currentConvId = null;
+let conversations = [];
+
+// ── API helpers ───────────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Erro ${res.status}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// ── Collections ──────────────────────────────────────────────────────────
+
+async function loadCollections() {
+  try {
+    const cols = await api("/collections/available");
+    const sel = document.getElementById("collection-select");
+    const section = document.getElementById("collection-section");
+    if (cols.length > 1) {
+      sel.innerHTML = cols.map(c => `<option value="${c}" ${c === currentCollection ? "selected" : ""}>${c}</option>`).join("");
+      section.classList.remove("hidden");
+    } else {
+      section.classList.add("hidden");
+      if (cols.length === 1) currentCollection = cols[0];
+    }
+  } catch {}
+}
+
+function switchCollection() {
+  currentCollection = document.getElementById("collection-select").value;
+  newConversation();
+}
+
+// ── Conversations ────────────────────────────────────────────────────────
+
+async function loadConversations() {
+  try {
+    conversations = await api("/conversations");
+    renderConvList();
+  } catch {}
+}
+
+function renderConvList() {
+  const el = document.getElementById("conv-list");
+  el.innerHTML = conversations.slice(0, 20).map(c => `
+    <div class="flex items-center group">
+      <button onclick="openConversation('${c.id}')"
+              class="flex-1 text-left text-sm px-2 py-1.5 rounded-md truncate transition
+                     ${c.id === currentConvId ? 'bg-indigo-50 text-indigo-700 font-medium' : 'text-gray-600 hover:bg-gray-100'}">
+        ${escHtml(c.title)}
+      </button>
+      <button onclick="deleteConversation('${c.id}')"
+              class="hidden group-hover:block text-gray-400 hover:text-red-500 px-1 text-xs" title="Excluir">✕</button>
+    </div>
+  `).join("");
+}
+
+async function openConversation(id) {
+  currentConvId = id;
+  const conv = conversations.find(c => c.id === id);
+  if (conv) currentCollection = conv.collection;
+  renderConvList();
+  try {
+    const msgs = await api(`/conversations/${id}/messages`);
+    const el = document.getElementById("messages");
+    el.innerHTML = "";
+    msgs.forEach(m => appendMessage(m.role, m.content, m.sources));
+    el.scrollTop = el.scrollHeight;
+  } catch {}
+}
+
+async function deleteConversation(id) {
+  try {
+    await api(`/conversations/${id}`, { method: "DELETE" });
+    if (currentConvId === id) newConversation();
+    loadConversations();
+  } catch {}
+}
+
+function newConversation() {
+  currentConvId = null;
+  const el = document.getElementById("messages");
+  el.innerHTML = document.getElementById("welcome") ? "" : "";
+  el.innerHTML = `<div class="flex items-center justify-center h-full">
+    <div class="text-center max-w-md">
+      <div class="text-5xl mb-4">📄</div>
+      <h2 class="text-xl font-semibold text-gray-700 mb-2">Bem-vindo ao Agent Factory</h2>
+      <p class="text-gray-500 text-sm">Envie um documento pela barra lateral e depois faça perguntas sobre ele.</p>
+    </div>
+  </div>`;
+  renderConvList();
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────
+
+async function sendMessage(e) {
+  e.preventDefault();
+  const input = document.getElementById("question");
+  const question = input.value.trim();
+  if (!question) return;
+
+  input.value = "";
+  input.style.height = "auto";
+  document.getElementById("welcome")?.remove();
+  document.querySelector("#messages > .flex.items-center")?.remove();
+
+  appendMessage("user", question, []);
+  const typing = showTyping();
+
+  const btn = document.getElementById("send-btn");
+  btn.disabled = true;
+
+  try {
+    const data = await api("/chat/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        conversation_id: currentConvId,
+        collection: currentCollection,
+        question,
+        history: [],
+      }),
+    });
+    currentConvId = data.conversation_id;
+    typing.remove();
+    appendMessage("assistant", data.answer, data.sources);
+    loadConversations();
+  } catch (err) {
+    typing.remove();
+    appendMessage("assistant", `Erro: ${err.message}`, []);
+  } finally {
+    btn.disabled = false;
+    document.getElementById("messages").scrollTop = document.getElementById("messages").scrollHeight;
+  }
+}
+
+function appendMessage(role, content, sources) {
+  const el = document.getElementById("messages");
+  const isUser = role === "user";
+  const div = document.createElement("div");
+  div.className = `max-w-3xl mx-auto ${isUser ? "flex justify-end" : ""}`;
+
+  const bubble = document.createElement("div");
+  bubble.className = isUser
+    ? "bg-indigo-600 text-white rounded-2xl rounded-br-sm px-4 py-2.5 max-w-lg text-sm"
+    : "bg-white border border-gray-200 rounded-2xl rounded-bl-sm px-4 py-3 text-sm shadow-sm msg-md";
+  bubble.innerHTML = isUser ? escHtml(content) : marked.parse(content);
+  div.appendChild(bubble);
+
+  if (sources && sources.length > 0 && !isUser) {
+    const srcDiv = document.createElement("div");
+    srcDiv.className = "mt-2 flex flex-wrap gap-1.5";
+    sources.forEach((s, i) => {
+      const badge = document.createElement("span");
+      badge.className = "source-badge bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full cursor-help";
+      const name = s.source_filename || s.doc_id || `Fonte ${i + 1}`;
+      const page = s.page_number ? ` p.${s.page_number}` : "";
+      badge.textContent = `[${i + 1}] ${name}${page}`;
+      badge.title = s.excerpt ? s.excerpt.slice(0, 200) : "";
+      srcDiv.appendChild(badge);
+    });
+    div.appendChild(srcDiv);
+  }
+
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+function showTyping() {
+  const el = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.className = "max-w-3xl mx-auto";
+  div.innerHTML = `<div class="bg-white border border-gray-200 rounded-2xl rounded-bl-sm px-4 py-3 text-sm shadow-sm text-gray-400 animate-pulse">Pensando...</div>`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  return div;
+}
+
+// ── Upload ───────────────────────────────────────────────────────────────
+
+async function uploadFile(file) {
+  if (!file) return;
+  const status = document.getElementById("upload-status");
+  status.classList.remove("hidden");
+  status.className = "mt-2 text-xs text-indigo-600 animate-pulse";
+  const isPdf = file.name.toLowerCase().endsWith(".pdf");
+  status.textContent = isPdf
+    ? `Processando ${file.name}... (PDFs podem demorar 1-2 min)`
+    : `Enviando ${file.name}...`;
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("collection", currentCollection);
+
+  try {
+    const data = await api("/ingest", { method: "POST", body: form });
+    status.className = "mt-2 text-xs text-green-600";
+    status.classList.remove("animate-pulse");
+    status.textContent = `${file.name} indexado (${data.chunks_indexed} trechos)`;
+    loadCollections();
+    loadDocuments();
+    setTimeout(() => status.classList.add("hidden"), 5000);
+  } catch (err) {
+    status.classList.remove("animate-pulse");
+    status.className = "mt-2 text-xs text-red-600";
+    status.textContent = `Erro: ${err.message}`;
+  }
+  document.getElementById("file-input").value = "";
+}
+
+async function loadDocuments() {
+  try {
+    const docs = await api(`/documents?collection=${encodeURIComponent(currentCollection)}`);
+    const el = document.getElementById("doc-list");
+    el.innerHTML = docs.slice(0, 8).map(d => `
+      <div class="flex items-center text-xs text-gray-500 group">
+        <span class="truncate flex-1" title="${escHtml(d.filename)}">${escHtml(d.filename)}</span>
+        <span class="text-gray-300 ml-1">${d.chunks_indexed}ch</span>
+      </div>
+    `).join("");
+  } catch {}
+}
+
+// ── Drag & drop ──────────────────────────────────────────────────────────
+
+const dropZone = document.getElementById("drop-zone");
+["dragenter", "dragover"].forEach(evt => dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add("drop-active"); }));
+["dragleave", "drop"].forEach(evt => dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove("drop-active"); }));
+dropZone.addEventListener("drop", e => { if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]); });
+
+// ── Auto-resize textarea ─────────────────────────────────────────────────
+
+const textarea = document.getElementById("question");
+textarea.addEventListener("input", () => { textarea.style.height = "auto"; textarea.style.height = Math.min(textarea.scrollHeight, 120) + "px"; });
+
+// ── Utils ────────────────────────────────────────────────────────────────
+
+function escHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────
+
+loadCollections();
+loadConversations();
+loadDocuments();
+</script>
+</body>
+</html>

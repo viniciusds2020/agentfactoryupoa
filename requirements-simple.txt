@@ -1,0 +1,24 @@
+# Dependências para o modo simples (sem sentence-transformers/PyTorch ~2GB)
+# Para modelos PT-BR especializados (Legal-BERTimbau), use requirements.txt
+
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-multipart>=0.0.12
+pydantic>=2.7
+pydantic-settings>=2.2
+httpx>=0.27
+
+# LLM
+groq>=0.9
+
+# Embeddings (ONNX — leve, sem PyTorch)
+fastembed>=0.7
+
+# Vector store
+faiss-cpu>=1.8
+
+# Text normalization
+nltk>=3.8
+
+# Document parsing
+docling>=2.80
