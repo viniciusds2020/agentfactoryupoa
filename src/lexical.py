@@ -45,7 +45,7 @@ _ROMAN_RE = re.compile(
 )
 
 
-def _roman_to_int(s: str) -> int:
+def roman_to_int(s: str) -> int:
     """Convert a Roman numeral string to integer. Returns 0 if invalid."""
     s = s.lower()
     if not s or not all(c in _ROMAN_VALUES for c in s):
@@ -69,7 +69,7 @@ def _replace_roman_numerals(text: str) -> str:
     """
     def _replace(match: re.Match) -> str:
         token = match.group(0)
-        value = _roman_to_int(token)
+        value = roman_to_int(token)
         return str(value) if value > 0 else token
 
     return _ROMAN_RE.sub(_replace, text)
@@ -84,7 +84,7 @@ _INT_TO_ROMAN = [
 _ARABIC_IN_QUERY_RE = re.compile(r"\b(\d{1,4})\b")
 
 
-def _int_to_roman(n: int) -> str:
+def int_to_roman(n: int) -> str:
     """Convert integer (1-3999) to Roman numeral string."""
     if n < 1 or n > 3999:
         return str(n)
@@ -110,11 +110,11 @@ def normalize_query_numerals(query: str) -> str:
     for m in _ARABIC_IN_QUERY_RE.finditer(query):
         n = int(m.group(1))
         if 1 <= n <= 3999:
-            additions.append(_int_to_roman(n))
+            additions.append(int_to_roman(n))
 
     # Roman -> add Arabic form
     for m in _ROMAN_RE.finditer(query):
-        val = _roman_to_int(m.group(0))
+        val = roman_to_int(m.group(0))
         if val > 0:
             additions.append(str(val))
 

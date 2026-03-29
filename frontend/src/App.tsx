@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowDown, Download, Loader2, Menu, Paperclip, RefreshCw, Send, Trash2, Upload, X } from 'lucide-react'
 import { api } from './api'
 import type {
+  CollectionSemanticProfile,
   CollectionInfo,
   Conversation,
   DocumentArtifacts,
   DocumentRecord,
   IngestionJob,
   Message,
+  TabularEvaluation,
 } from './api'
 import Sidebar from './components/Sidebar'
 import ChatMessage from './components/ChatMessage'
@@ -48,7 +50,7 @@ const MODE_TO_INGEST_PROFILE: Record<BaseMode, string> = {
 const MODE_TO_CHAT_PROFILE: Record<BaseMode, string> = {
   general: 'general',
   legal: 'legal',
-  tabular: 'general',
+  tabular: 'tabular',
 }
 
 function loadModeStateMap(): Record<string, BaseModeState> {
@@ -110,6 +112,8 @@ export default function App() {
   const [uploading, setUploading] = useState(false)
   const [uploadMsg, setUploadMsg] = useState<'ok' | 'err' | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [tableContext, setTableContext] = useState('')
+  const [tableContextDirty, setTableContextDirty] = useState(false)
   const [jobs, setJobs] = useState<IngestionJob[]>([])
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [jobsSupported, setJobsSupported] = useState(true)
@@ -120,6 +124,10 @@ export default function App() {
   const [artifactError, setArtifactError] = useState<string | null>(null)
   const [artifactTab, setArtifactTab] = useState<'markdown' | 'json'>('markdown')
   const [artifactSourceDoc, setArtifactSourceDoc] = useState<DocumentRecord | null>(null)
+  const [semanticProfile, setSemanticProfile] = useState<CollectionSemanticProfile | null>(null)
+  const [semanticLoading, setSemanticLoading] = useState(false)
+  const [semanticError, setSemanticError] = useState<string | null>(null)
+  const [tabularEval, setTabularEval] = useState<TabularEvaluation | null>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -210,6 +218,16 @@ export default function App() {
   }, [collection, modeStateMap])
 
   useEffect(() => {
+    if (baseMode !== 'tabular' || tableContextDirty) return
+    const existingContext = documents.find((doc) => doc.collection === collection && doc.context_hint?.trim())?.context_hint || ''
+    setTableContext(existingContext)
+  }, [baseMode, collection, documents, tableContextDirty])
+
+  useEffect(() => {
+    setTableContextDirty(false)
+  }, [collection, baseMode])
+
+  useEffect(() => {
     if (!collection) return
     if (documents.some((doc) => doc.collection === collection && doc.status === 'indexed') && !isModeLocked) {
       setModeStateForCollection(collection, {
@@ -225,6 +243,38 @@ export default function App() {
       void refreshIngestionData()
     }
   }, [activeTab, refreshIngestionData])
+
+  useEffect(() => {
+    if (activeTab !== 'ingestion' || !collection || baseMode !== 'tabular') {
+      setSemanticProfile(null)
+      setSemanticError(null)
+      return
+    }
+    let cancelled = false
+    const loadSemanticProfile = async () => {
+      setSemanticLoading(true)
+      setSemanticError(null)
+      try {
+        const [profile, evaluation] = await Promise.all([
+          api.getCollectionSemanticProfile(collection),
+          api.getTabularEvaluation().catch(() => null),
+        ])
+        if (cancelled) return
+        setSemanticProfile(profile)
+        setTabularEval(evaluation)
+      } catch (err) {
+        if (cancelled) return
+        setSemanticError(err instanceof Error ? err.message : 'Falha ao carregar semantica da base.')
+        setSemanticProfile(null)
+      } finally {
+        if (!cancelled) setSemanticLoading(false)
+      }
+    }
+    void loadSemanticProfile()
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, collection, baseMode, documents])
 
   const hasActiveJobs =
     jobsSupported &&
@@ -330,10 +380,12 @@ export default function App() {
           embedModel,
           file,
           effectiveIngestProfile,
+          tableContext.trim(),
         )
         asyncAccepted = true
         setUploadMsg('ok')
         setUploadError(`Arquivo recebido. Job ${job.id.slice(0, 8)} em andamento.`)
+        setTableContextDirty(false)
       } catch (err) {
         const msg = err instanceof Error ? err.message : ''
         const shouldFallback = msg.includes('404') || msg.includes('405')
@@ -341,9 +393,10 @@ export default function App() {
       }
 
       if (!asyncAccepted) {
-        await api.ingestDocument(collection || 'documentos', embedModel, file, effectiveIngestProfile)
+        await api.ingestDocument(collection || 'documentos', embedModel, file, effectiveIngestProfile, tableContext.trim())
         setUploadMsg('ok')
         setUploadError('Documento processado e indexado com sucesso.')
+        setTableContextDirty(false)
       }
 
       if (collection) {
@@ -364,6 +417,20 @@ export default function App() {
       setUploadError(err instanceof Error ? err.message : 'Erro ao enviar arquivo.')
     } finally {
       setUploading(false)
+    }
+  }
+
+  const saveTableContext = async () => {
+    if (!collection) return
+    try {
+      const result = await api.updateCollectionContext(collection, tableContext.trim())
+      setUploadMsg('ok')
+      setUploadError(`Contexto salvo para ${result.updated_documents} documento(s) da base.`)
+      setTableContextDirty(false)
+      await refreshIngestionData()
+    } catch (err) {
+      setUploadMsg('err')
+      setUploadError(err instanceof Error ? err.message : 'Falha ao salvar contexto da base.')
     }
   }
 
@@ -770,6 +837,42 @@ export default function App() {
                             )}
                           </div>
                         </div>
+                        {baseMode === 'tabular' && (
+                          <div className="ops-item">
+                            <div className="ops-item-main">
+                              <div className="ops-item-title">Contexto da Base</div>
+                              <div className="ops-item-meta">
+                                Descreva o que esta tabela representa e o significado das colunas principais. Isso melhora a interpretacao das perguntas.
+                              </div>
+                              <textarea
+                                value={tableContext}
+                                onChange={(e) => {
+                                  setTableContext(e.target.value)
+                                  setTableContextDirty(true)
+                                }}
+                                placeholder="Ex.: Cadastro de clientes com renda mensal, score de credito, cidade, estado e status do cadastro."
+                                rows={4}
+                                style={{
+                                  width: '100%',
+                                  marginTop: 10,
+                                  borderRadius: 12,
+                                  border: '1px solid rgba(76, 201, 240, 0.2)',
+                                  background: 'rgba(5, 12, 24, 0.72)',
+                                  color: 'inherit',
+                                  padding: '12px 14px',
+                                  resize: 'vertical',
+                                }}
+                              />
+                              {documents.length > 0 && (
+                                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+                                  <button className="empty-upload-btn" onClick={() => void saveTableContext()} disabled={uploading || !tableContextDirty}>
+                                    salvar contexto
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
                       </div>
                       {!file ? (
                         <button className="empty-upload-btn" onClick={() => fileRef.current?.click()}>
@@ -878,6 +981,81 @@ export default function App() {
                     </div>
                   )}
                 </section>
+
+                {baseMode === 'tabular' && (
+                  <section className="ops-panel glass-panel ops-card ops-card-docs">
+                    <div className="ops-header">
+                      <div>
+                        <div className="ops-kicker">Semantica</div>
+                        <div className="ops-title">Perfil da Base</div>
+                      </div>
+                      <button className="ops-refresh" onClick={() => void refreshIngestionData()}>
+                        <RefreshCw size={14} />
+                        atualizar
+                      </button>
+                    </div>
+                    {semanticLoading ? (
+                      <div className="ops-empty">Carregando perfil semantico...</div>
+                    ) : semanticError ? (
+                      <div className="ops-item-error">{semanticError}</div>
+                    ) : !semanticProfile || semanticProfile.columns.length === 0 ? (
+                      <div className="ops-empty">O perfil semantico aparecera apos a ingestao tabular da base.</div>
+                    ) : (
+                      <div className="ops-list ops-list-compact">
+                        <div className="ops-item">
+                          <div className="ops-item-main">
+                            <div className="ops-item-title">Contexto e Sujeito</div>
+                            <div className="ops-item-meta">
+                              sujeito: {semanticProfile.profile?.subject_label || 'registros'}
+                            </div>
+                            <div className="ops-item-meta">
+                              {semanticProfile.profile?.base_context || tableContext || 'Sem contexto salvo.'}
+                            </div>
+                          </div>
+                        </div>
+                        {tabularEval && (
+                          <div className="ops-item">
+                            <div className="ops-item-main">
+                              <div className="ops-item-title">Benchmark Tabular</div>
+                              <div className="ops-item-meta">
+                                planner: {(tabularEval.summary.tabular_plan_success_rate * 100).toFixed(0)}% •
+                                unidade: {(tabularEval.summary.unit_render_accuracy * 100).toFixed(0)}% •
+                                schema: {(tabularEval.summary.schema_question_success_rate * 100).toFixed(0)}%
+                              </div>
+                              <div className="ops-item-meta">
+                                dataset: {tabularEval.dataset || 'tabular_gold'} • casos: {tabularEval.cases}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        {semanticProfile.columns.slice(0, 8).map((col) => (
+                          <div key={col.column_name} className="ops-item">
+                            <div className="ops-item-main">
+                              <div className="ops-item-title">
+                                {col.column_name} • {col.semantic_type}
+                              </div>
+                              <div className="ops-item-meta">
+                                role: {col.role} • unidade: {col.unit || 'n/a'} • cardinalidade: {col.cardinality}
+                              </div>
+                              <div className="ops-item-meta">{col.description}</div>
+                              <div className="ops-item-meta">
+                                aliases: {col.aliases.slice(0, 5).join(', ') || '-'}
+                              </div>
+                              <div className="ops-item-meta">
+                                operacoes: {col.allowed_operations.join(', ') || '-'}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                        {semanticProfile.columns.length > 8 && (
+                          <div className="ops-empty">
+                            Exibindo 8 de {semanticProfile.columns.length} colunas perfiladas.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                )}
 
                 <section className="ops-panel glass-panel ops-card ops-card-docs">
                   <div className="ops-header">

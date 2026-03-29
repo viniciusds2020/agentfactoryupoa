@@ -30,6 +30,18 @@ class TestClassifyIntentRegex:
     def test_question_factual(self):
         assert _classify_intent_regex("Qual o prazo para pagamento?") == QueryIntent.QUESTION_FACTUAL
 
+    def test_count_structural(self):
+        assert _classify_intent_regex("Quantos capitulos tem no estatuto?") == QueryIntent.COUNT_STRUCTURAL
+
+    def test_list_structural(self):
+        assert _classify_intent_regex("Quais artigos estao no capitulo II?") == QueryIntent.LIST_STRUCTURAL
+
+    def test_locate_structural(self):
+        assert _classify_intent_regex("Qual e o ultimo capitulo?") == QueryIntent.LOCATE_STRUCTURAL
+
+    def test_contains_structural(self):
+        assert _classify_intent_regex("O capitulo V tem secao III?") == QueryIntent.CONTAINS_STRUCTURAL
+
     def test_comparison(self):
         assert _classify_intent_regex("Compare o capítulo 1 e o capítulo 2") == QueryIntent.COMPARISON
 
@@ -111,6 +123,10 @@ class TestClassifyIntentEmbeddings:
             QueryIntent.SUMMARY_STRUCTURAL: [1.0, 0.0, 0.0],
             QueryIntent.QUESTION_STRUCTURAL: [0.0, 1.0, 0.0],
             QueryIntent.QUESTION_FACTUAL: [0.0, 0.0, 1.0],
+            QueryIntent.COUNT_STRUCTURAL: [0.6, 0.4, 0.0],
+            QueryIntent.LIST_STRUCTURAL: [0.2, 0.8, 0.0],
+            QueryIntent.LOCATE_STRUCTURAL: [0.4, 0.5, 0.1],
+            QueryIntent.CONTAINS_STRUCTURAL: [0.35, 0.55, 0.1],
             QueryIntent.LOCATE_EXCERPT: [0.5, 0.5, 0.0],
             QueryIntent.COMPARISON: [0.0, 0.5, 0.5],
         }

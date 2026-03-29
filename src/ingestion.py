@@ -1059,10 +1059,16 @@ def ingest(
     )
 
     forced_type = (domain_profile or "").strip().lower()
+    extension_forced_type = ""
+    if suffix in {".csv", ".xlsx", ".xls"}:
+        extension_forced_type = "tabular"
+
     if forced_type == "legal":
         doc_type = "legal"
     elif forced_type in {"tabular", "mixed", "narrative"}:
         doc_type = forced_type
+    elif extension_forced_type:
+        doc_type = extension_forced_type
     else:
         doc_type = classification.doc_type
 
@@ -1399,11 +1405,12 @@ def _ingest_tabular(
         )
 
     if settings.structured_store_enabled:
-        from src.structured_store import upsert_records
+        from src.structured_store import persist_table_semantics, upsert_records
 
         with metrics.time_block("ingestion.structured_store_upsert"):
             try:
                 upsert_records(collection, doc_id, extraction.records, extraction.column_names)
+                persist_table_semantics(collection, workspace_id=workspace_id, context_hint="")
             except Exception as exc:
                 log_event(
                     logger, 30, "Structured store upsert failed; continuing with vector indexing",

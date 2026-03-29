@@ -1494,6 +1494,19 @@ input::placeholder {
   line-height: 1.7;
 }
 
+.source-result-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(5, 18, 29, 0.82);
+  border: 1px solid rgba(49, 194, 255, 0.16);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+}
+
 .typing {
   display: inline-flex;
   gap: 6px;

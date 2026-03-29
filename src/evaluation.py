@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Callable
 
 from src.lexical import tokenize
+from src.table_planner import build_query_plan
+from src.table_validator import validate_query_plan
 
 
 GOLD_CORPUS = [
@@ -267,13 +269,13 @@ def structural_hit_at_1(
 
 
 def _normalize_numeral_token(value: str) -> str:
-    from src.lexical import _roman_to_int
+    from src.lexical import roman_to_int
     token = value.strip().upper()
     if not token:
         return ""
     if token.isdigit():
         return str(int(token))
-    arabic = _roman_to_int(token)
+    arabic = roman_to_int(token)
     if arabic > 0:
         return str(arabic)
     return token
@@ -486,3 +488,153 @@ def evaluate_ab(
         "deltas_b_minus_a": deltas,
         "per_query_wins": wins,
     }
+
+
+TABULAR_GOLD_CASES = [
+    {
+        "question": "Qual e a media de idade dos clientes do Ceara?",
+        "expected_intent": "tabular_aggregate",
+        "expected_metric": "idade",
+        "expected_filter_column": "estado",
+        "expected_unit": "anos",
+    },
+    {
+        "question": "Qual e a renda total no estado de Sao Paulo?",
+        "expected_intent": "tabular_aggregate",
+        "expected_metric": "renda_mensal",
+        "expected_filter_column": "estado",
+        "expected_unit": "brl",
+    },
+    {
+        "question": "Quais sao os estados UF da tabela?",
+        "expected_intent": "tabular_distinct",
+        "expected_dimension": "estado",
+    },
+    {
+        "question": "Quais sao as colunas da tabela?",
+        "expected_intent": "tabular_schema",
+    },
+]
+
+
+def evaluate_tabular_plans(
+    planner_fn: Callable[[str], dict | None],
+    gold_cases: list[dict] | None = None,
+) -> dict[str, object]:
+    cases = gold_cases or TABULAR_GOLD_CASES
+    total = len(cases)
+    if total == 0:
+        return {}
+
+    successes = 0
+    metric_hits = 0
+    filter_hits = 0
+    unit_hits = 0
+    schema_hits = 0
+    distinct_hits = 0
+    compare_hits = 0
+    details: list[dict] = []
+
+    metric_cases = 0
+    filter_cases = 0
+    unit_cases = 0
+    schema_cases = 0
+    distinct_cases = 0
+    compare_cases = 0
+
+    for case in cases:
+        plan = planner_fn(case["question"]) or {}
+        if plan:
+            successes += 1
+        expected_metric = case.get("expected_metric")
+        if expected_metric:
+            metric_cases += 1
+            if plan.get("metric_column") == expected_metric:
+                metric_hits += 1
+        expected_filter_column = case.get("expected_filter_column")
+        if expected_filter_column:
+            filter_cases += 1
+            filters = plan.get("filters", []) or []
+            if any(f.get("column") == expected_filter_column for f in filters):
+                filter_hits += 1
+        expected_unit = case.get("expected_unit")
+        if expected_unit:
+            unit_cases += 1
+            if plan.get("expected_unit") == expected_unit:
+                unit_hits += 1
+        if case.get("expected_intent") == "tabular_schema":
+            schema_cases += 1
+            if plan.get("intent") == "tabular_schema":
+                schema_hits += 1
+        if case.get("expected_intent") == "tabular_distinct":
+            distinct_cases += 1
+            if plan.get("intent") == "tabular_distinct":
+                distinct_hits += 1
+        if case.get("expected_intent") == "tabular_compare":
+            compare_cases += 1
+            if plan.get("intent") == "tabular_compare":
+                compare_hits += 1
+        details.append(
+            {
+                "question": case["question"],
+                "expected_intent": case.get("expected_intent", ""),
+                "actual_intent": plan.get("intent", ""),
+                "metric_column": plan.get("metric_column"),
+                "filters": plan.get("filters", []),
+                "expected_unit": case.get("expected_unit", ""),
+                "actual_unit": plan.get("expected_unit", ""),
+            }
+        )
+
+    return {
+        "cases": total,
+        "summary": {
+            "tabular_plan_success_rate": round(successes / total, 4),
+            "metric_resolution_accuracy": round(metric_hits / max(1, metric_cases), 4),
+            "filter_resolution_accuracy": round(filter_hits / max(1, filter_cases), 4),
+            "unit_render_accuracy": round(unit_hits / max(1, unit_cases), 4),
+            "schema_question_success_rate": round(schema_hits / max(1, schema_cases), 4),
+            "distinct_question_success_rate": round(distinct_hits / max(1, distinct_cases), 4),
+            "compare_question_success_rate": round(compare_hits / max(1, compare_cases), 4),
+        },
+        "details": details,
+    }
+
+
+def load_tabular_gold_dataset(path: str | Path | None = None) -> dict:
+    p = Path(path) if path is not None else Path("data/eval/tabular_gold_dataset.json")
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+        "context_hint": "Base tabular de clientes com idade, renda_mensal, score_credito, cidade, estado, segmento, status_cadastro e data_cadastro.",
+        "profiles": [
+            {"name": "id_cliente", "role": "identifier", "semantic_type": "identifier", "unit": "text", "aliases": ["id", "id_cliente"]},
+            {"name": "idade", "role": "metric", "semantic_type": "measure_age_years", "unit": "anos", "aliases": ["idade"]},
+            {"name": "renda_mensal", "role": "metric", "semantic_type": "measure_currency", "unit": "brl", "aliases": ["renda", "renda mensal"]},
+            {"name": "score_credito", "role": "metric", "semantic_type": "measure_score", "unit": "pontos", "aliases": ["score", "score credito"]},
+            {"name": "cidade", "role": "dimension", "semantic_type": "dimension_geo_city", "unit": "text", "aliases": ["cidade"]},
+            {"name": "estado", "role": "dimension", "semantic_type": "dimension_geo_state", "unit": "text", "aliases": ["estado", "uf"]},
+            {"name": "segmento", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["segmento"]},
+            {"name": "status_cadastro", "role": "dimension", "semantic_type": "dimension_status", "unit": "text", "aliases": ["status", "status cadastro"]},
+        ],
+        "cases": TABULAR_GOLD_CASES,
+    }
+
+
+def evaluate_tabular_benchmark(path: str | Path | None = None) -> dict[str, object]:
+    dataset = load_tabular_gold_dataset(path)
+    profiles = list(dataset.get("profiles", []))
+    context_hint = str(dataset.get("context_hint", ""))
+    cases = list(dataset.get("cases", []))
+
+    def planner_fn(question: str) -> dict | None:
+        plan_model = build_query_plan(question, profiles, filters=[], context_hint=context_hint)
+        if not plan_model:
+            return None
+        validation = validate_query_plan(plan_model.model_dump(), profiles)
+        return validation.normalized_plan if validation.valid else None
+
+    report = evaluate_tabular_plans(planner_fn, gold_cases=cases)
+    report["dataset"] = str(path) if path is not None else "embedded_tabular_gold_ptbr"
+    report["context_hint"] = context_hint
+    return report

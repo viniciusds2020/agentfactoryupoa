@@ -45,6 +45,7 @@ class DocumentRecord:
     status: str
     chunks_indexed: int
     error: str
+    context_hint: str
     created_at: str
     updated_at: str
 
@@ -100,6 +101,7 @@ def init_db() -> None:
                     status          TEXT NOT NULL,
                     chunks_indexed  INTEGER NOT NULL DEFAULT 0,
                     error           TEXT NOT NULL DEFAULT '',
+                    context_hint    TEXT NOT NULL DEFAULT '',
                     created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                     updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                     UNIQUE(workspace_id, collection, doc_id, embedding_model),
@@ -192,6 +194,72 @@ def init_db() -> None:
                     ON document_summaries(workspace_id, collection, doc_id);
                 CREATE INDEX IF NOT EXISTS idx_summaries_node
                     ON document_summaries(workspace_id, collection, node_id);
+
+                CREATE TABLE IF NOT EXISTS table_profiles (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id    TEXT NOT NULL,
+                    collection      TEXT NOT NULL,
+                    table_name      TEXT NOT NULL DEFAULT '',
+                    base_context    TEXT NOT NULL DEFAULT '',
+                    subject_label   TEXT NOT NULL DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    UNIQUE(workspace_id, collection)
+                );
+
+                CREATE TABLE IF NOT EXISTS column_profiles (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id    TEXT NOT NULL,
+                    collection      TEXT NOT NULL,
+                    column_name     TEXT NOT NULL,
+                    display_name    TEXT NOT NULL DEFAULT '',
+                    physical_type   TEXT NOT NULL DEFAULT '',
+                    semantic_type   TEXT NOT NULL DEFAULT '',
+                    role            TEXT NOT NULL DEFAULT '',
+                    unit            TEXT NOT NULL DEFAULT '',
+                    aliases_json    TEXT NOT NULL DEFAULT '[]',
+                    examples_json   TEXT NOT NULL DEFAULT '[]',
+                    description     TEXT NOT NULL DEFAULT '',
+                    cardinality     INTEGER NOT NULL DEFAULT 0,
+                    allowed_ops_json TEXT NOT NULL DEFAULT '[]',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    UNIQUE(workspace_id, collection, column_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS value_catalog (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id    TEXT NOT NULL,
+                    collection      TEXT NOT NULL,
+                    column_name     TEXT NOT NULL,
+                    normalized_value TEXT NOT NULL DEFAULT '',
+                    raw_value       TEXT NOT NULL DEFAULT '',
+                    frequency       INTEGER NOT NULL DEFAULT 0,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS query_plans_log (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id        TEXT NOT NULL,
+                    collection          TEXT NOT NULL,
+                    question            TEXT NOT NULL DEFAULT '',
+                    planner_source      TEXT NOT NULL DEFAULT '',
+                    plan_json           TEXT NOT NULL DEFAULT '{}',
+                    validated           INTEGER NOT NULL DEFAULT 0,
+                    validation_errors_json TEXT NOT NULL DEFAULT '[]',
+                    sql_generated       TEXT NOT NULL DEFAULT '',
+                    created_at          TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_table_profiles_workspace_collection
+                    ON table_profiles(workspace_id, collection);
+                CREATE INDEX IF NOT EXISTS idx_column_profiles_workspace_collection
+                    ON column_profiles(workspace_id, collection);
+                CREATE INDEX IF NOT EXISTS idx_value_catalog_workspace_collection
+                    ON value_catalog(workspace_id, collection, column_name);
+                CREATE INDEX IF NOT EXISTS idx_query_plans_workspace_collection
+                    ON query_plans_log(workspace_id, collection, created_at DESC);
                 """
             )
 
@@ -209,6 +277,7 @@ def _ensure_schema_migrations() -> None:
     with closing(_connect()) as conn:
         with conn:
             additions = [
+                ("documents", "context_hint", "TEXT NOT NULL DEFAULT ''"),
                 ("document_summaries", "source_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("document_summaries", "source_text_length", "INTEGER NOT NULL DEFAULT 0"),
                 ("document_summaries", "status", "TEXT NOT NULL DEFAULT 'generated'"),
@@ -241,6 +310,7 @@ def _row_to_document(row: sqlite3.Row) -> DocumentRecord:
         status=row["status"],
         chunks_indexed=row["chunks_indexed"],
         error=row["error"],
+        context_hint=row["context_hint"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -362,6 +432,7 @@ def upsert_document(
     status: str,
     chunks_indexed: int = 0,
     error: str = "",
+    context_hint: str = "",
 ) -> DocumentRecord:
     with closing(_connect()) as conn:
         with conn:
@@ -369,14 +440,18 @@ def upsert_document(
                 """
                 INSERT INTO documents (
                     id, workspace_id, collection, doc_id, filename, embedding_model,
-                    status, chunks_indexed, error
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                    status, chunks_indexed, error, context_hint
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(workspace_id, collection, doc_id, embedding_model)
                 DO UPDATE SET
                     filename=excluded.filename,
                     status=excluded.status,
                     chunks_indexed=excluded.chunks_indexed,
                     error=excluded.error,
+                    context_hint=CASE
+                        WHEN excluded.context_hint <> '' THEN excluded.context_hint
+                        ELSE documents.context_hint
+                    END,
                     updated_at=datetime('now','localtime')
                 """,
                 (
@@ -389,6 +464,7 @@ def upsert_document(
                     status,
                     chunks_indexed,
                     error,
+                    context_hint,
                 ),
             )
         row = conn.execute(
@@ -436,6 +512,214 @@ def delete_document_record(workspace_id: str, collection: str, doc_id: str, embe
         with conn:
             cursor = conn.execute(query, params)
             return cursor.rowcount
+
+
+def get_collection_context(workspace_id: str, collection: str) -> str:
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT context_hint
+            FROM documents
+            WHERE workspace_id=? AND collection=? AND TRIM(context_hint) <> ''
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (workspace_id, collection),
+        ).fetchone()
+    return str(row["context_hint"]).strip() if row else ""
+
+
+def update_collection_context(workspace_id: str, collection: str, context_hint: str) -> int:
+    cleaned = (context_hint or "").strip()
+    from src.table_semantics import infer_subject_label
+
+    with closing(_connect()) as conn:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE documents
+                SET context_hint=?,
+                    updated_at=datetime('now','localtime')
+                WHERE workspace_id=? AND collection=?
+                """,
+                (cleaned, workspace_id, collection),
+            )
+            conn.execute(
+                """
+                INSERT INTO table_profiles (
+                    workspace_id, collection, table_name, base_context, subject_label
+                ) VALUES (?,?,?,?,?)
+                ON CONFLICT(workspace_id, collection)
+                DO UPDATE SET
+                    base_context=excluded.base_context,
+                    subject_label=excluded.subject_label,
+                    updated_at=datetime('now','localtime')
+                """,
+                (
+                    workspace_id,
+                    collection,
+                    "",
+                    cleaned,
+                    infer_subject_label("", cleaned),
+                ),
+            )
+            return cursor.rowcount
+
+
+def upsert_table_profile(
+    workspace_id: str,
+    collection: str,
+    table_name: str,
+    base_context: str,
+    subject_label: str,
+) -> None:
+    with closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO table_profiles (
+                    workspace_id, collection, table_name, base_context, subject_label
+                ) VALUES (?,?,?,?,?)
+                ON CONFLICT(workspace_id, collection)
+                DO UPDATE SET
+                    table_name=excluded.table_name,
+                    base_context=excluded.base_context,
+                    subject_label=excluded.subject_label,
+                    updated_at=datetime('now','localtime')
+                """,
+                (workspace_id, collection, table_name, base_context, subject_label),
+            )
+
+
+def get_table_profile(workspace_id: str, collection: str) -> dict | None:
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT workspace_id, collection, table_name, base_context, subject_label,
+                   created_at, updated_at
+            FROM table_profiles
+            WHERE workspace_id=? AND collection=?
+            LIMIT 1
+            """,
+            (workspace_id, collection),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def replace_column_profiles(workspace_id: str, collection: str, profiles: list[dict]) -> None:
+    with closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                "DELETE FROM column_profiles WHERE workspace_id=? AND collection=?",
+                (workspace_id, collection),
+            )
+            for profile in profiles:
+                conn.execute(
+                    """
+                    INSERT INTO column_profiles (
+                        workspace_id, collection, column_name, display_name, physical_type,
+                        semantic_type, role, unit, aliases_json, examples_json, description,
+                        cardinality, allowed_ops_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        workspace_id,
+                        collection,
+                        profile.get("name", ""),
+                        profile.get("display_name") or profile.get("name", ""),
+                        profile.get("data_type", ""),
+                        profile.get("semantic_type", ""),
+                        profile.get("role", ""),
+                        profile.get("unit", ""),
+                        json.dumps(profile.get("aliases", []), ensure_ascii=False),
+                        json.dumps(profile.get("examples", []), ensure_ascii=False),
+                        profile.get("description", ""),
+                        int(profile.get("cardinality", 0) or 0),
+                        json.dumps(profile.get("allowed_operations", []), ensure_ascii=False),
+                    ),
+                )
+
+
+def list_column_profiles(workspace_id: str, collection: str) -> list[dict]:
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM column_profiles
+            WHERE workspace_id=? AND collection=?
+            ORDER BY id ASC
+            """,
+            (workspace_id, collection),
+        ).fetchall()
+    results: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        item["aliases"] = json.loads(item.pop("aliases_json", "[]") or "[]")
+        item["examples"] = json.loads(item.pop("examples_json", "[]") or "[]")
+        item["allowed_operations"] = json.loads(item.pop("allowed_ops_json", "[]") or "[]")
+        results.append(item)
+    return results
+
+
+def replace_value_catalog(
+    workspace_id: str,
+    collection: str,
+    values_by_column: dict[str, list[dict]],
+) -> None:
+    with closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                "DELETE FROM value_catalog WHERE workspace_id=? AND collection=?",
+                (workspace_id, collection),
+            )
+            for column_name, values in values_by_column.items():
+                for item in values:
+                    conn.execute(
+                        """
+                        INSERT INTO value_catalog (
+                            workspace_id, collection, column_name, normalized_value, raw_value, frequency
+                        ) VALUES (?,?,?,?,?,?)
+                        """,
+                        (
+                            workspace_id,
+                            collection,
+                            column_name,
+                            item.get("normalized_value", ""),
+                            item.get("raw_value", ""),
+                            int(item.get("frequency", 0) or 0),
+                        ),
+                    )
+
+
+def log_query_plan(
+    workspace_id: str,
+    collection: str,
+    question: str,
+    planner_source: str,
+    plan: dict,
+    validated: bool,
+    validation_errors: list[str],
+    sql_generated: str = "",
+) -> None:
+    with closing(_connect()) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO query_plans_log (
+                    workspace_id, collection, question, planner_source, plan_json,
+                    validated, validation_errors_json, sql_generated
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    workspace_id,
+                    collection,
+                    question,
+                    planner_source,
+                    json.dumps(plan, ensure_ascii=False),
+                    1 if validated else 0,
+                    json.dumps(validation_errors, ensure_ascii=False),
+                    sql_generated,
+                ),
+            )
 
 
 def list_collection_stats(workspace_id: str) -> list[dict]:

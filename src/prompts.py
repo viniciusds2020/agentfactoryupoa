@@ -52,6 +52,11 @@ _DOMAIN_ADDENDUMS: dict[str, str] = {
         "Trate o contexto como material juridico ou contratual. Destaque prazos, obrigacoes, "
         "multas, clausulas, vigencia e excecoes. Evite extrapolar alem do texto."
     ),
+    "tabular": (
+        "Trate o contexto como dados tabulares e estruturados. Priorize metricas, agregacoes, "
+        "filtros, comparacoes e linguagem executiva. Quando a resposta vier de consulta analitica, "
+        "seja direto, informe claramente o criterio adotado e evite narrar trechos como se fossem texto corrido."
+    ),
     "hr": (
         "Trate o contexto como politica de pessoas e relacoes trabalhistas. Destaque beneficios, "
         "jornada, afastamentos, ferias, folha, elegibilidade e regras de RH."

@@ -22,3 +22,7 @@ nltk>=3.8
 
 # Document parsing
 docling>=2.80
+pdfplumber>=0.11
+
+# Structured retrieval (optional — used when STRUCTURED_STORE_ENABLED=true)
+duckdb>=1.0

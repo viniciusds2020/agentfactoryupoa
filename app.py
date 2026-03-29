@@ -28,7 +28,9 @@ from src.controlplane import (
     ensure_default_workspace,
     get_document,
     get_ingestion_job,
+    get_table_profile,
     list_audit_events,
+    list_column_profiles,
     list_collection_stats,
     list_collections_with_models,
     list_documents as list_document_records,
@@ -36,11 +38,12 @@ from src.controlplane import (
     list_workspaces,
     record_audit,
     resolve_workspace,
+    update_collection_context,
     update_ingestion_job,
     upsert_document,
 )
 from src.prompts import list_domain_profiles
-from src.evaluation import evaluate_retrieval_snapshot
+from src.evaluation import evaluate_retrieval_snapshot, evaluate_tabular_benchmark
 from src.guardrails import chat_limiter, ingest_limiter, sanitize_question, validate_collection
 from src.observability import metrics
 from src.utils import get_logger, log_event, new_request_id, request_id_var
@@ -172,6 +175,9 @@ class SourceOut(BaseModel):
     page_number: int | None = None
     source_filename: str = ""
     citation_label: str = ""
+    source_kind: str = ""
+    query_summary: str = ""
+    result_preview: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -264,8 +270,51 @@ class DocumentOut(BaseModel):
     status: str
     chunks_indexed: int
     error: str
+    context_hint: str
     created_at: str
     updated_at: str
+
+
+class UpdateCollectionContextRequest(BaseModel):
+    context_hint: str = ""
+
+
+class CollectionContextOut(BaseModel):
+    collection: str
+    context_hint: str
+    updated_documents: int
+
+
+class TableProfileOut(BaseModel):
+    workspace_id: str
+    collection: str
+    table_name: str
+    base_context: str
+    subject_label: str
+    created_at: str
+    updated_at: str
+
+
+class ColumnProfileOut(BaseModel):
+    workspace_id: str
+    collection: str
+    column_name: str
+    display_name: str
+    physical_type: str
+    semantic_type: str
+    role: str
+    unit: str
+    aliases: list[str]
+    examples: list[str]
+    description: str
+    cardinality: int
+    allowed_operations: list[str]
+
+
+class CollectionSemanticProfileOut(BaseModel):
+    collection: str
+    profile: TableProfileOut | None = None
+    columns: list[ColumnProfileOut]
 
 
 class CollectionStatsOut(BaseModel):
@@ -301,6 +350,14 @@ class DocumentArtifactsOut(BaseModel):
     available: bool
 
 
+class TabularEvaluationOut(BaseModel):
+    cases: int
+    summary: dict[str, float]
+    details: list[dict]
+    dataset: str | None = None
+    context_hint: str | None = None
+
+
 class AuditEventOut(BaseModel):
     id: int
     workspace_id: str
@@ -325,7 +382,10 @@ def _sources_out(sources: list) -> list[SourceOut]:
             score=s.score,
             page_number=s.metadata.get("page_number") if s.metadata else None,
             source_filename=s.metadata.get("source_filename", "") if s.metadata else "",
-            citation_label=_citation_label(s.metadata if s.metadata else {}),
+            citation_label=(s.metadata.get("citation_label", "") if s.metadata else "") or _citation_label(s.metadata if s.metadata else {}),
+            source_kind=s.metadata.get("source_kind", "") if s.metadata else "",
+            query_summary=s.metadata.get("query_summary", "") if s.metadata else "",
+            result_preview=s.metadata.get("result_preview", "") if s.metadata else "",
         )
         for s in sources
     ]
@@ -341,6 +401,9 @@ def _map_stored_source(source: dict) -> SourceOut:
         page_number=source.get("page_number") or metadata.get("page_number"),
         source_filename=source.get("source_filename", "") or metadata.get("source_filename", ""),
         citation_label=source.get("citation_label", "") or _citation_label(metadata),
+        source_kind=source.get("source_kind", "") or metadata.get("source_kind", ""),
+        query_summary=source.get("query_summary", "") or metadata.get("query_summary", ""),
+        result_preview=source.get("result_preview", "") or metadata.get("result_preview", ""),
     )
 
 
@@ -667,6 +730,7 @@ async def ingest_document(
     embedding_model: str = Form(""),
     doc_id: str = Form(""),
     domain_profile: str = Form(""),
+    context_hint: str = Form(""),
     file: UploadFile = File(...),
 ) -> IngestResponse:
     """Upload and index a document into a collection.
@@ -718,6 +782,7 @@ async def ingest_document(
                 status="bronze_received",
                 chunks_indexed=0,
                 error="",
+                context_hint=context_hint,
             )
             upsert_document(
                 workspace_id=workspace.id,
@@ -728,6 +793,7 @@ async def ingest_document(
                 status="silver_processing",
                 chunks_indexed=0,
                 error="",
+                context_hint=context_hint,
             )
 
             def _on_stage(status: str, payload: dict) -> None:
@@ -743,6 +809,7 @@ async def ingest_document(
                     status=status,
                     chunks_indexed=chunks if isinstance(chunks, int) else 0,
                     error="",
+                    context_hint=context_hint,
                 )
 
             def _run_ingest_with_optional_callback():
@@ -774,6 +841,7 @@ async def ingest_document(
                 status="indexed",
                 chunks_indexed=n,
                 error="",
+                context_hint=context_hint,
             )
             record_audit(
                 workspace_id=workspace.id,
@@ -797,6 +865,7 @@ async def ingest_document(
                 status="failed",
                 chunks_indexed=0,
                 error=str(exc),
+                context_hint=context_hint,
             )
             record_audit(
                 workspace_id=workspace.id,
@@ -1119,7 +1188,10 @@ async def chat_message_stream(req: ChatWithHistoryRequest, request: Request):
                     "score": s.score,
                     "page_number": s.metadata.get("page_number") if s.metadata else None,
                     "source_filename": s.metadata.get("source_filename", "") if s.metadata else "",
-                    "citation_label": _citation_label(s.metadata if s.metadata else {}),
+                    "citation_label": (s.metadata.get("citation_label", "") if s.metadata else "") or _citation_label(s.metadata if s.metadata else {}),
+                    "source_kind": s.metadata.get("source_kind", "") if s.metadata else "",
+                    "query_summary": s.metadata.get("query_summary", "") if s.metadata else "",
+                    "result_preview": s.metadata.get("result_preview", "") if s.metadata else "",
                 }
                 for s in ctx.sources
             ],
@@ -1190,6 +1262,64 @@ def get_documents(request: Request, collection: str | None = Query(default=None)
         collection = _validate_collection_or_422(collection)
     docs = list_document_records(workspace.id, collection=collection)
     return [DocumentOut(**doc.__dict__) for doc in docs]
+
+
+@app.patch("/collections/{collection}/context", response_model=CollectionContextOut)
+def patch_collection_context(collection: str, req: UpdateCollectionContextRequest, request: Request):
+    workspace = _get_workspace(request)
+    collection = _validate_collection_or_422(collection)
+    updated = update_collection_context(workspace.id, collection, req.context_hint)
+    if updated == 0:
+        raise HTTPException(status_code=404, detail="Nenhum documento encontrado para esta base.")
+    return CollectionContextOut(
+        collection=collection,
+        context_hint=req.context_hint.strip(),
+        updated_documents=updated,
+    )
+
+
+@app.get("/collections/{collection}/semantic-profile", response_model=CollectionSemanticProfileOut)
+def get_collection_semantic_profile(collection: str, request: Request):
+    workspace = _get_workspace(request)
+    collection = _validate_collection_or_422(collection)
+    profile = get_table_profile(workspace.id, collection)
+    columns = list_column_profiles(workspace.id, collection)
+    if not profile and not columns:
+        try:
+            from src.structured_store import has_structured_data, persist_table_semantics
+
+            if has_structured_data(collection):
+                persist_table_semantics(
+                    collection=collection,
+                    workspace_id=workspace.id,
+                    context_hint=profile.get("base_context", "") if isinstance(profile, dict) else "",
+                )
+                profile = get_table_profile(workspace.id, collection)
+                columns = list_column_profiles(workspace.id, collection)
+        except Exception:
+            pass
+    return CollectionSemanticProfileOut(
+        collection=collection,
+        profile=TableProfileOut(**profile) if profile else None,
+        columns=[
+            ColumnProfileOut(
+                workspace_id=item["workspace_id"],
+                collection=item["collection"],
+                column_name=item["column_name"],
+                display_name=item.get("display_name") or item["column_name"],
+                physical_type=item.get("physical_type") or item.get("data_type", ""),
+                semantic_type=item.get("semantic_type", ""),
+                role=item.get("role", ""),
+                unit=item.get("unit", ""),
+                aliases=item.get("aliases", []),
+                examples=item.get("examples", []),
+                description=item.get("description", ""),
+                cardinality=int(item.get("cardinality", 0) or 0),
+                allowed_operations=item.get("allowed_operations", []),
+            )
+            for item in columns
+        ],
+    )
 
 
 @app.delete("/documents/{doc_id}", status_code=204)
@@ -1309,6 +1439,11 @@ async def get_retrieval_evaluation(top_k: int = Query(default=5, ge=1, le=10)):
     return RetrievalEvaluationOut(**evaluate_retrieval_snapshot(top_k=top_k))
 
 
+@enterprise_router.get("/evaluation/tabular", response_model=TabularEvaluationOut)
+async def get_tabular_evaluation():
+    return TabularEvaluationOut(**evaluate_tabular_benchmark())
+
+
 @enterprise_router.get("/observability", response_model=ObservabilityOut)
 async def get_observability():
     return ObservabilityOut(**metrics.snapshot())
@@ -1340,6 +1475,7 @@ async def ingest_document_async(
     embedding_model: str = Form(""),
     doc_id: str = Form(""),
     domain_profile: str = Form(""),
+    context_hint: str = Form(""),
     file: UploadFile = File(...),
 ) -> IngestionJobOut:
     workspace = _get_workspace(request)
@@ -1372,6 +1508,7 @@ async def ingest_document_async(
         filename=file.filename or resolved_doc_id or "",
         embedding_model=resolved_embedding_model,
         status="bronze_received",
+        context_hint=context_hint,
     )
     record_audit(
         workspace_id=workspace.id,

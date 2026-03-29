@@ -1,5 +1,5 @@
 import pytest
-from src.lexical import tokenize, _PT_STOPWORDS, _normalize, _roman_to_int, _replace_roman_numerals, normalize_query_numerals, _int_to_roman
+from src.lexical import tokenize, _PT_STOPWORDS, _normalize, roman_to_int, _replace_roman_numerals, normalize_query_numerals, int_to_roman
 
 
 def test_tokenize_removes_accents():
@@ -43,32 +43,32 @@ def test_stopwords_are_normalized():
 # ── Roman numeral tests ─────────────────────────────────────────────────────
 
 
-def test_roman_to_int_basic():
-    assert _roman_to_int("I") == 1
-    assert _roman_to_int("V") == 5
-    assert _roman_to_int("X") == 10
-    assert _roman_to_int("L") == 50
-    assert _roman_to_int("C") == 100
-    assert _roman_to_int("D") == 500
-    assert _roman_to_int("M") == 1000
+def testroman_to_int_basic():
+    assert roman_to_int("I") == 1
+    assert roman_to_int("V") == 5
+    assert roman_to_int("X") == 10
+    assert roman_to_int("L") == 50
+    assert roman_to_int("C") == 100
+    assert roman_to_int("D") == 500
+    assert roman_to_int("M") == 1000
 
 
-def test_roman_to_int_compound():
-    assert _roman_to_int("IV") == 4
-    assert _roman_to_int("IX") == 9
-    assert _roman_to_int("XIV") == 14
-    assert _roman_to_int("XL") == 40
-    assert _roman_to_int("XLII") == 42
-    assert _roman_to_int("XC") == 90
-    assert _roman_to_int("CXXIII") == 123
-    assert _roman_to_int("CD") == 400
-    assert _roman_to_int("CM") == 900
-    assert _roman_to_int("MMXXVI") == 2026
+def testroman_to_int_compound():
+    assert roman_to_int("IV") == 4
+    assert roman_to_int("IX") == 9
+    assert roman_to_int("XIV") == 14
+    assert roman_to_int("XL") == 40
+    assert roman_to_int("XLII") == 42
+    assert roman_to_int("XC") == 90
+    assert roman_to_int("CXXIII") == 123
+    assert roman_to_int("CD") == 400
+    assert roman_to_int("CM") == 900
+    assert roman_to_int("MMXXVI") == 2026
 
 
-def test_roman_to_int_invalid():
-    assert _roman_to_int("") == 0
-    assert _roman_to_int("ABC") == 0
+def testroman_to_int_invalid():
+    assert roman_to_int("") == 0
+    assert roman_to_int("ABC") == 0
 
 
 def test_replace_roman_numerals_in_text():
@@ -90,21 +90,21 @@ def test_normalize_converts_roman_to_arabic():
 # ── Integer to Roman conversion ───────────────────────────────────────────
 
 
-def test_int_to_roman_basic():
-    assert _int_to_roman(1) == "I"
-    assert _int_to_roman(4) == "IV"
-    assert _int_to_roman(5) == "V"
-    assert _int_to_roman(9) == "IX"
-    assert _int_to_roman(10) == "X"
-    assert _int_to_roman(14) == "XIV"
-    assert _int_to_roman(42) == "XLII"
-    assert _int_to_roman(100) == "C"
-    assert _int_to_roman(2026) == "MMXXVI"
+def testint_to_roman_basic():
+    assert int_to_roman(1) == "I"
+    assert int_to_roman(4) == "IV"
+    assert int_to_roman(5) == "V"
+    assert int_to_roman(9) == "IX"
+    assert int_to_roman(10) == "X"
+    assert int_to_roman(14) == "XIV"
+    assert int_to_roman(42) == "XLII"
+    assert int_to_roman(100) == "C"
+    assert int_to_roman(2026) == "MMXXVI"
 
 
-def test_int_to_roman_out_of_range():
-    assert _int_to_roman(0) == "0"
-    assert _int_to_roman(4000) == "4000"
+def testint_to_roman_out_of_range():
+    assert int_to_roman(0) == "0"
+    assert int_to_roman(4000) == "4000"
 
 
 # ── Query numeral normalization ───────────────────────────────────────────

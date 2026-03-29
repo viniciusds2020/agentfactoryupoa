@@ -48,6 +48,64 @@ def test_ingest_passes_embedding_model(monkeypatch):
     assert captured["workspace_id"] == "default"
 
 
+def test_patch_collection_context_updates_base(monkeypatch):
+    monkeypatch.setattr("app.update_collection_context", lambda workspace_id, collection, context_hint: 1)
+
+    response = client.patch(
+        "/collections/base_csv/context",
+        json={"context_hint": "Base de clientes com renda mensal e localizacao"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collection"] == "base_csv"
+    assert payload["updated_documents"] == 1
+    assert "clientes" in payload["context_hint"]
+
+
+def test_get_collection_semantic_profile(monkeypatch):
+    monkeypatch.setattr(
+        "app.get_table_profile",
+        lambda workspace_id, collection: {
+            "workspace_id": workspace_id,
+            "collection": collection,
+            "table_name": "cadastro_records",
+            "base_context": "Base de clientes",
+            "subject_label": "clientes",
+            "created_at": "2026-03-29 10:00:00",
+            "updated_at": "2026-03-29 10:00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "app.list_column_profiles",
+        lambda workspace_id, collection: [
+            {
+                "workspace_id": workspace_id,
+                "collection": collection,
+                "column_name": "renda_mensal",
+                "display_name": "renda_mensal",
+                "physical_type": "numeric",
+                "semantic_type": "measure_currency",
+                "role": "metric",
+                "unit": "brl",
+                "aliases": ["renda"],
+                "examples": ["1000"],
+                "description": "Medida monetaria.",
+                "cardinality": 100,
+                "allowed_operations": ["sum", "avg"],
+            }
+        ],
+    )
+
+    response = client.get("/collections/base_csv/semantic-profile")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collection"] == "base_csv"
+    assert payload["profile"]["subject_label"] == "clientes"
+    assert payload["columns"][0]["semantic_type"] == "measure_currency"
+
+
 def test_ingest_returns_422_with_underlying_error_detail(monkeypatch):
     monkeypatch.setattr("src.ingestion.ingest", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("parser failure")))
 
@@ -291,3 +349,21 @@ def test_retrieval_evaluation_endpoint_returns_snapshot():
     payload = response.json()
     assert payload["top_k"] == 3
     assert "vector" in payload
+
+
+def test_tabular_evaluation_endpoint_returns_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        "app.evaluate_tabular_benchmark",
+        lambda: {
+            "cases": 7,
+            "summary": {"tabular_plan_success_rate": 1.0},
+            "details": [{"question": "Qual e a media de idade dos clientes do Ceara?"}],
+        },
+    )
+
+    response = client.get("/evaluation/tabular")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cases"] == 7
+    assert payload["summary"]["tabular_plan_success_rate"] == 1.0

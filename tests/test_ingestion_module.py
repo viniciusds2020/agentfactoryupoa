@@ -216,6 +216,46 @@ def test_ingest_routes_to_tabular_when_classifier_says_tabular(monkeypatch, tmp_
     assert captured["tabular_called"] is True
 
 
+def test_ingest_routes_csv_to_tabular_even_if_classifier_says_narrative(monkeypatch, tmp_path: Path):
+    path = tmp_path / "base.csv"
+    path.write_text("id,nome,renda\n1,Ana,1000\n2,Bia,2000\n", encoding="utf-8")
+
+    monkeypatch.setattr("src.ingestion.log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.config.get_settings", lambda: type("S", (), {
+        "embedding_model": "model-a",
+        "chunk_size": 512,
+        "chunk_overlap": 64,
+        "pdf_pipeline_enabled": False,
+        "legal_chunk_overlap": 160,
+        "tabular_chunk_group_size": 5,
+        "tabular_chunk_max_chars": 512,
+        "structured_store_enabled": False,
+    })())
+    monkeypatch.setattr(
+        "src.classifier.classify_document",
+        lambda **kwargs: type("C", (), {"doc_type": "narrative", "table_ratio": 0.0})(),
+    )
+    monkeypatch.setattr("src.llm.embed", lambda chunks, model_name=None: [[0.1] for _ in chunks])
+    monkeypatch.setattr("src.vectordb.collection_key", lambda c, m, workspace_id="default": f"{workspace_id}::{c}::{m}")
+    monkeypatch.setattr("src.vectordb.delete_by_doc_id", lambda *a, **k: 0)
+    monkeypatch.setattr("src.vectordb.upsert", lambda *a, **k: None)
+
+    captured = {"tabular_called": False}
+
+    def fake_tabular(*args, **kwargs):
+        captured["tabular_called"] = True
+        return ["chunk tabular"], ["chunk tabular"], [{"doc_id": "base.csv", "chunk_type": "tabular"}]
+
+    monkeypatch.setattr("src.ingestion._ingest_tabular", fake_tabular)
+    monkeypatch.setattr("src.ingestion._ingest_general", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr("src.ingestion._ingest_legal", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr("src.ingestion._ingest_mixed", lambda *a, **k: ([], [], []))
+
+    total = ingestion.ingest("geral", str(path), doc_id="base.csv", embedding_model="model-x")
+    assert total == 1
+    assert captured["tabular_called"] is True
+
+
 def test_ingest_routes_to_mixed_when_classifier_says_mixed(monkeypatch, tmp_path: Path):
     path = tmp_path / "doc.txt"
     path.write_text("texto misto", encoding="utf-8")

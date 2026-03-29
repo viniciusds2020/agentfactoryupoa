@@ -263,7 +263,7 @@ def test_extract_structural_scope_from_artifact(monkeypatch, tmp_path):
         doc_id = "estatuto.pdf"
         filename = "estatuto.pdf"
 
-    monkeypatch.setattr("src.chat.get_settings", lambda: type("S", (), {"pdf_pipeline_artifacts_dir": str(artifacts)})())
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
     monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
     monkeypatch.setattr(
         "src.summaries.generate_summary_from_scope_text",
@@ -294,6 +294,639 @@ def test_extract_structural_scope_from_artifact(monkeypatch, tmp_path):
     )
     assert summary is not None
     assert "CAPÍTULO I" in summary["label"]
+
+
+def test_answer_structure_first_counts_chapters(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO I - DAS CARACTERISTICAS", "page_number": 1},
+            {"block_type": "body", "text": "Art. 1 - Texto.", "page_number": 1},
+            {"block_type": "section_header", "text": "CAPITULO II - DOS OBJETIVOS SOCIAIS", "page_number": 2},
+            {"block_type": "body", "text": "Art. 2 - Texto.", "page_number": 2},
+            {"block_type": "section_header", "text": "CAPITULO III - DA ADMINISTRACAO", "page_number": 3},
+            {"block_type": "body", "text": "Art. 3 - Texto.", "page_number": 3},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="Quantos capitulos tem no estatuto?", request_id="req-count")
+
+    assert "3 capitulo(s)" in result.answer.lower()
+    assert result.sources[0].metadata["requested_type"] == "capitulo"
+
+
+def test_answer_structure_first_lists_articles_within_chapter(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO I - DAS CARACTERISTICAS", "page_number": 1},
+            {"block_type": "body", "text": "Art. 1 - Texto.", "page_number": 1},
+            {"block_type": "section_header", "text": "CAPITULO II - DOS OBJETIVOS SOCIAIS", "page_number": 2},
+            {"block_type": "body", "text": "Art. 2 - Texto.", "page_number": 2},
+            {"block_type": "body", "text": "Art. 3 - Texto.", "page_number": 2},
+            {"block_type": "section_header", "text": "CAPITULO III - DA ADMINISTRACAO", "page_number": 3},
+            {"block_type": "body", "text": "Art. 4 - Texto.", "page_number": 3},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="Quais artigos estao no capitulo II?", request_id="req-list")
+
+    assert "art. 2" in result.answer.lower()
+    assert "art. 3" in result.answer.lower()
+    assert result.sources[0].metadata["scope"] == "CAPITULO II - DOS OBJETIVOS SOCIAIS"
+
+
+def test_answer_structure_first_locates_last_chapter(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO I - DAS CARACTERISTICAS", "page_number": 1},
+            {"block_type": "body", "text": "Art. 1 - Texto.", "page_number": 1},
+            {"block_type": "section_header", "text": "CAPITULO II - DOS OBJETIVOS SOCIAIS", "page_number": 2},
+            {"block_type": "body", "text": "Art. 2 - Texto.", "page_number": 2},
+            {"block_type": "section_header", "text": "CAPITULO III - DA ADMINISTRACAO", "page_number": 5},
+            {"block_type": "body", "text": "Art. 3 - Texto.", "page_number": 5},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="Qual e o ultimo capitulo?", request_id="req-locate")
+
+    assert "capitulo iii - da administracao" in result.answer.lower()
+    assert "pagina 5" in result.answer.lower()
+
+
+def test_answer_structure_first_contains_section_in_chapter(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO V - DA ASSEMBLEIA GERAL", "page_number": 7},
+            {"block_type": "section_header", "text": "SECAO I - DA ASSEMBLEIA GERAL ORDINARIA", "page_number": 7},
+            {"block_type": "body", "text": "Art. 29 - Texto.", "page_number": 7},
+            {"block_type": "section_header", "text": "SECAO III - DA ASSEMBLEIA GERAL EXTRAORDINARIA", "page_number": 8},
+            {"block_type": "body", "text": "Art. 33 - Texto.", "page_number": 8},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="O capitulo V tem secao III?", request_id="req-contains")
+
+    assert result.answer.lower().startswith("sim.")
+    assert "secao iii" in result.answer.lower()
+    assert result.sources[0].metadata["scope"] == "CAPITULO V - DA ASSEMBLEIA GERAL"
+
+
+def test_answer_structure_first_contains_negative_article(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO II - DOS OBJETIVOS SOCIAIS", "page_number": 2},
+            {"block_type": "body", "text": "Art. 2 - Texto.", "page_number": 2},
+            {"block_type": "body", "text": "Art. 3 - Texto.", "page_number": 2},
+            {"block_type": "section_header", "text": "CAPITULO III - DA ADMINISTRACAO", "page_number": 5},
+            {"block_type": "body", "text": "Art. 4 - Texto.", "page_number": 5},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="Existe art. 41 no capitulo II?", request_id="req-contains-neg")
+
+    assert result.answer.lower().startswith("nao.")
+    assert "capitulo ii" in result.answer.lower()
+
+
+def test_answer_exact_article_from_artifact_uses_requested_article(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO II - DOS OBJETIVOS SOCIAIS", "page_number": 2},
+            {"block_type": "body", "text": "Art. 2º - A Cooperativa objetiva promover o desenvolvimento progressivo e a defesa de suas atividades de carater comum.", "page_number": 2},
+            {"block_type": "body", "text": "Paragrafo unico - sem objetivo de lucro.", "page_number": 2},
+            {"block_type": "body", "text": "Art. 3º - Poderao associar-se na Cooperativa os medicos que preencham os requisitos.", "page_number": 3},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    captured = {}
+
+    def fake_chat(messages, system=""):
+        captured["messages"] = messages
+        return "O Art. 2 estabelece os objetivos sociais da Cooperativa."
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.chat", fake_chat)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(
+        collection="teste",
+        question="Quais sao os objetivos da Cooperativa previstos no Art. 2º?",
+        request_id="req-art-2",
+        domain_profile="legal",
+    )
+
+    assert "art. 2" in result.answer.lower()
+    assert result.sources[0].metadata["artigo"] == "Art. 2"
+    joined = "\n".join(msg["content"] for msg in captured["messages"])
+    assert "Art. 2º" in joined or "Art. 2" in joined
+    assert "Art. 3º" not in joined
+
+
+def test_answer_exact_article_from_artifact_for_locate_excerpt(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {"block_type": "section_header", "text": "CAPITULO V - DA ASSEMBLEIA GERAL", "page_number": 7},
+            {"block_type": "body", "text": "Art. 33 - E da competencia exclusiva da Assembleia Geral Extraordinaria deliberar sobre os seguintes assuntos.", "page_number": 8},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.chat", lambda messages, system="": "O Art. 33 trata da competencia exclusiva da Assembleia Geral Extraordinaria.")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(collection="teste", question="Art. 33", request_id="req-art-33")
+
+    assert "art. 33" in result.answer.lower()
+    assert result.sources[0].metadata["artigo"] == "Art. 33"
+
+
+def test_answer_exact_article_from_header_block(monkeypatch, tmp_path):
+    artifacts = tmp_path / "processed"
+    artifacts.mkdir()
+    payload = {
+        "blocks": [
+            {
+                "block_type": "section_header",
+                "text": "CAPITULO II DOS OBJETIVOS SOCIAIS Art. 2º - A sociedade objetiva, com base na colaboracao reciproca, promover o desenvolvimento progressivo e a defesa de suas atividades.",
+                "page_number": 2,
+            },
+            {"block_type": "body", "text": "Paragrafo 1 - Sem objetivo de lucro.", "page_number": 2},
+            {"block_type": "body", "text": "Art. 3º - Outro artigo.", "page_number": 3},
+        ]
+    }
+    (artifacts / "estatuto.pdf.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class Doc:
+        doc_id = "estatuto.pdf"
+        filename = "estatuto.pdf"
+
+    monkeypatch.setattr("src.chat.get_settings", lambda: _settings(pdf_pipeline_artifacts_dir=str(artifacts)))
+    monkeypatch.setattr("src.controlplane.list_documents", lambda workspace_id, collection: [Doc()])
+    monkeypatch.setattr("src.chat.llm.chat", lambda messages, system="": "O Art. 2 trata dos objetivos sociais da Cooperativa.")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(
+        collection="teste",
+        question="Quais sao os objetivos da Cooperativa previstos no Art. 2º?",
+        request_id="req-art-header",
+        domain_profile="legal",
+    )
+
+    assert "art. 2" in result.answer.lower()
+    assert result.sources[0].metadata["artigo"] == "Art. 2"
+
+
+def test_answer_table_first_aggregate_sum_by_state(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"nome": "Ana", "renda_mensal": "1000", "estado": "RJ", "cidade": "Rio de Janeiro"}),
+        Rec(1, {"nome": "Bia", "renda_mensal": "2500", "estado": "RJ", "cidade": "Niteroi"}),
+        Rec(2, {"nome": "Caio", "renda_mensal": "3000", "estado": "SP", "cidade": "Sao Paulo"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["nome", "renda_mensal", "estado", "cidade"])
+
+    result = chat.answer(collection="cadastro", question="Qual e a renda do estado do Rio de Janeiro?", request_id="req-table-sum")
+
+    assert "3.500,00" in result.answer
+    assert "estado de RJ" in result.answer or "estado = RJ" in result.answer
+    assert result.sources[0].metadata["source"] == "structured_store"
+    assert result.sources[0].metadata["source_kind"] == "table_query"
+    assert result.sources[0].metadata["plan"]["aggregation"] == "sum"
+    assert "SELECT SUM(" in result.sources[0].metadata["query_summary"]
+    assert "resultado:" in result.sources[0].metadata["result_preview"]
+
+
+def test_answer_table_first_average_with_numeric_filter_and_state_preference(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"idade": "35", "renda_mensal": "1500.50", "estado": "SP", "cidade": "Sao Paulo"}),
+        Rec(1, {"idade": "28", "renda_mensal": "2500.75", "estado": "SP", "cidade": "Campinas"}),
+        Rec(2, {"idade": "45", "renda_mensal": "3500.00", "estado": "SP", "cidade": "Santos"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["idade", "renda_mensal", "estado", "cidade"])
+
+    result = chat.answer(
+        collection="cadastro",
+        question="Qual e a media de renda em Sao Paulo com pessoas acima de 30 anos?",
+        request_id="req-table-filtered-avg",
+    )
+
+    assert "2.500,25" in result.answer
+    assert "estado de SP" in result.answer
+    assert "cidade de Sao Paulo" not in result.answer
+    sql = result.sources[0].metadata["query_summary"]
+    assert "AVG(" in sql
+    assert "estado" in sql
+    assert "idade" in sql
+    assert " > ?" in sql
+
+
+def test_answer_table_first_groupby_average(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"renda_mensal": "1000", "estado": "RJ"}),
+        Rec(1, {"renda_mensal": "3000", "estado": "RJ"}),
+        Rec(2, {"renda_mensal": "4000", "estado": "SP"}),
+        Rec(3, {"renda_mensal": "6000", "estado": "SP"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["renda_mensal", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Qual a media por estado?", request_id="req-table-group")
+
+    assert "por estado" in result.answer.lower()
+    assert "sp: r$ 5.000,00" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "groupby"
+    assert "resultado:" not in result.sources[0].metadata["result_preview"]
+
+
+def test_answer_table_first_average_age_uses_years_not_currency(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"idade": "20", "estado": "CE"}),
+        Rec(1, {"idade": "40", "estado": "CE"}),
+        Rec(2, {"idade": "60", "estado": "SP"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["idade", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Qual e a media de idade dos clientes do Ceara?", request_id="req-table-age")
+
+    assert "30,00 anos" in result.answer
+    assert "R$" not in result.answer
+    assert result.sources[0].metadata["plan"]["metric_unit"] == "anos"
+
+
+def test_answer_table_first_count_formats_as_integer(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"id_cliente": "1", "estado": "RJ"}),
+        Rec(1, {"id_cliente": "2", "estado": "RJ"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["id_cliente", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Quantos clientes tem no estado do Rio de Janeiro?", request_id="req-table-count")
+
+    assert " 2." in result.answer or result.answer.endswith(" 2.")
+    assert "2,00" not in result.answer
+    assert result.sources[0].metadata["plan"]["aggregation"] == "count"
+
+
+def test_answer_table_first_distinct_inventory(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"id_cliente": "1", "estado": "RJ"}),
+        Rec(1, {"id_cliente": "2", "estado": "SP"}),
+        Rec(2, {"id_cliente": "3", "estado": "BA"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["id_cliente", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Quais sao os estados que estao na base?", request_id="req-table-distinct")
+
+    assert "estados presentes na base" in result.answer.lower()
+    assert "BA" in result.answer
+    assert "RJ" in result.answer
+    assert "SP" in result.answer
+    assert result.sources[0].metadata["plan"]["operation"] == "distinct"
+
+
+def test_answer_table_first_uses_collection_context_hint(monkeypatch):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: True)
+
+    captured = {}
+
+    def fake_plan_query(collection, question, context_hint=""):
+        captured["context_hint"] = context_hint
+        return {
+            "operation": "aggregate",
+            "metric_column": None,
+            "aggregation": "count",
+            "filters": [{"column": "estado", "operator": "=", "value": "RJ"}],
+            "group_by": [],
+            "limit": 1,
+            "assumption": "",
+        }
+
+    monkeypatch.setattr("src.structured_store.plan_query", fake_plan_query)
+    monkeypatch.setattr("src.structured_store.execute_plan", lambda collection, plan: {"operation": "aggregate", "value": 7, "plan": plan})
+    monkeypatch.setattr("src.chat._get_collection_context_hint", lambda workspace_id, collection: "Base de clientes com cidade, estado e renda mensal.")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    result = chat.answer(
+        collection="cadastro",
+        question="Quantos tem no estado do Rio de Janeiro?",
+        request_id="req-context-hint",
+    )
+
+    assert captured["context_hint"].startswith("Base de clientes")
+    assert "clientes" in result.answer.lower()
+    assert result.sources[0].metadata["context_hint"].startswith("Base de clientes")
+
+
+def test_answer_table_first_distinct_inventory_states_uf(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"id_cliente": "1", "estado": "RJ"}),
+        Rec(1, {"id_cliente": "2", "estado": "SP"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["id_cliente", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Quais sao os estados UF que estao na tabela?", request_id="req-table-uf")
+
+    assert "estados presentes na base" in result.answer.lower()
+    assert "RJ" in result.answer
+    assert "SP" in result.answer
+    assert "id clientes" not in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "distinct"
+    assert result.sources[0].metadata["plan"]["dimension_column"] == "estado"
+
+
+def test_answer_table_first_schema_columns(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"id_cliente": "1", "nome": "Ana", "estado": "RJ"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["id_cliente", "nome", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Quais sao as colunas da tabela?", request_id="req-table-schema")
+
+    assert "colunas da tabela" in result.answer.lower()
+    assert "id_cliente" in result.answer
+    assert "estado" in result.answer
+    assert "dimensoes principais" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "schema"
+
+
+def test_answer_table_first_describe_column(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"id_cliente": "1", "score_credito": "780"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["id_cliente", "score_credito"])
+
+    result = chat.answer(collection="cadastro", question="O que significa a coluna score_credito?", request_id="req-table-describe")
+
+    assert "score_credito" in result.answer
+    assert "tipo semantico" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "describe_column"
+
+
+def test_answer_table_first_compare_is_executive(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {"renda_mensal": "1000", "estado": "RJ"}),
+        Rec(1, {"renda_mensal": "3000", "estado": "RJ"}),
+        Rec(2, {"renda_mensal": "4000", "estado": "SP"}),
+        Rec(3, {"renda_mensal": "6000", "estado": "SP"}),
+    ]
+    structured_store.upsert_records("cadastro", "doc.csv", records, ["renda_mensal", "estado"])
+
+    result = chat.answer(collection="cadastro", question="Compare SP e RJ em renda media por estado", request_id="req-table-compare")
+
+    assert "comparativo" in result.answer.lower()
+    assert "lidera" in result.answer.lower()
+    assert "diferenca" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "compare"
 
 
 def test_answer_returns_direct_message_when_no_results(monkeypatch):

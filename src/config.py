@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # ── Structured store ───────────────────────────────────────────────────────
     structured_store_path: str = "data/structured.duckdb"
     structured_store_enabled: bool = True
+    table_planner_llm_enabled: bool = False
 
     # ── Query routing ──────────────────────────────────────────────────────────
     query_routing_enabled: bool = True

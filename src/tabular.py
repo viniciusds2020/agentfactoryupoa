@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 _INTERNAL_FOOTER_RE = re.compile(r"classifica[cç][aã]o da informa[cç][aã]o:\s*interno", re.IGNORECASE)
 _CODE_RE = re.compile(r"^\d{5,}$")
+_DIGIT_SIGNAL_RE = re.compile(r"\d")
 
 
 def _normalize_cell(value: object) -> str:
@@ -27,6 +28,16 @@ def _row_has_valid_code(row: list[str]) -> bool:
         if _CODE_RE.match(cell.strip()):
             return True
     return False
+
+
+def _row_looks_tabular(row: list[str], expected_columns: int) -> bool:
+    non_empty = [cell.strip() for cell in row if cell.strip()]
+    if len(non_empty) < max(2, min(expected_columns, 3)):
+        return False
+    if _row_has_valid_code(row):
+        return True
+    digit_cells = sum(1 for cell in non_empty if _DIGIT_SIGNAL_RE.search(cell))
+    return digit_cells >= 2
 
 
 @dataclass
@@ -92,7 +103,7 @@ def extract_tables_pdfplumber(pdf_path: str) -> TableExtractionResult:
                         cells[i].strip().lower() == raw_header[i].strip().lower() for i in range(min(len(raw_header), len(cells)))
                     ):
                         continue
-                    if not _row_has_valid_code(cells):
+                    if not _row_looks_tabular(cells, len(local_header)):
                         continue
                     mapped = {}
                     for i, col in enumerate(local_header):
@@ -157,7 +168,7 @@ def extract_tables_from_text(text: str) -> TableExtractionResult:
             ):
                 i += 1
                 continue
-            if not _row_has_valid_code(cells):
+            if not _row_looks_tabular(cells, len(raw_header)):
                 i += 1
                 continue
             fields = {col: (cells[idx] if idx < len(cells) else "") for idx, col in enumerate(local_cols)}

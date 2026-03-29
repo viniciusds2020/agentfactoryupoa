@@ -37,6 +37,18 @@ def test_extract_tables_from_text_ignores_rows_without_code():
     assert result.records[0].fields["codigo"] == "12345"
 
 
+def test_extract_tables_from_text_accepts_csv_like_rows_with_short_ids():
+    md = """
+| id_cliente | nome | idade | renda_mensal | estado |
+| --- | --- | --- | --- | --- |
+| 1 | Ursula Souza | 19 | 26341.94 | MG |
+| 2 | Ana Souza | 31 | 9294.14 | SC |
+"""
+    result = extract_tables_from_text(md)
+    assert len(result.records) == 2
+    assert result.records[0].fields["id_cliente"] == "1"
+
+
 def test_chunk_tabular_records_groups_short_rows():
     records = [
         TableRecord(i, 1, {"codigo": str(10000 + i)}, f"codigo: {10000 + i}", f"raw {i}")

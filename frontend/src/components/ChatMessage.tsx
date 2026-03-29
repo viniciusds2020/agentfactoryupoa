@@ -5,6 +5,7 @@ import SourceCards from './SourceCards'
 const PROFILE_LABELS: Record<string, string> = {
   general: 'Corporativo geral',
   legal: 'Juridico',
+  tabular: 'Planilhas/Tabelas',
   hr: 'RH',
 }
 

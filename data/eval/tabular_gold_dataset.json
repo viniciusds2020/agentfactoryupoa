@@ -1,0 +1,102 @@
+{
+  "context_hint": "Base de cadastro de clientes pessoa fisica. idade em anos. renda_mensal em BRL. score_credito em pontos. estado e a UF do cliente. status_cadastro indica situacao comercial.",
+  "profiles": [
+    {
+      "name": "id_cliente",
+      "role": "identifier",
+      "semantic_type": "identifier",
+      "unit": "text",
+      "aliases": ["id", "id cliente", "id_cliente"]
+    },
+    {
+      "name": "idade",
+      "role": "metric",
+      "semantic_type": "measure_age_years",
+      "unit": "anos",
+      "aliases": ["idade", "idade do cliente"]
+    },
+    {
+      "name": "renda_mensal",
+      "role": "metric",
+      "semantic_type": "measure_currency",
+      "unit": "brl",
+      "aliases": ["renda", "renda mensal", "salario"]
+    },
+    {
+      "name": "score_credito",
+      "role": "metric",
+      "semantic_type": "measure_score",
+      "unit": "pontos",
+      "aliases": ["score", "score credito", "score_credito"]
+    },
+    {
+      "name": "cidade",
+      "role": "dimension",
+      "semantic_type": "dimension_geo_city",
+      "unit": "text",
+      "aliases": ["cidade", "municipio"]
+    },
+    {
+      "name": "estado",
+      "role": "dimension",
+      "semantic_type": "dimension_geo_state",
+      "unit": "text",
+      "aliases": ["estado", "uf"]
+    },
+    {
+      "name": "segmento",
+      "role": "dimension",
+      "semantic_type": "dimension_category",
+      "unit": "text",
+      "aliases": ["segmento", "categoria"]
+    },
+    {
+      "name": "status_cadastro",
+      "role": "dimension",
+      "semantic_type": "dimension_status",
+      "unit": "text",
+      "aliases": ["status", "status cadastro"]
+    }
+  ],
+  "cases": [
+    {
+      "question": "Qual e a media de idade dos clientes do Ceara?",
+      "expected_intent": "tabular_aggregate",
+      "expected_metric": "idade",
+      "expected_filter_column": "estado",
+      "expected_unit": "anos"
+    },
+    {
+      "question": "Qual e a renda total no estado de Sao Paulo?",
+      "expected_intent": "tabular_aggregate",
+      "expected_metric": "renda_mensal",
+      "expected_filter_column": "estado",
+      "expected_unit": "brl"
+    },
+    {
+      "question": "Quantos clientes ativos existem em MG?",
+      "expected_intent": "tabular_count",
+      "expected_filter_column": "estado",
+      "expected_unit": "count"
+    },
+    {
+      "question": "Quais sao os estados UF da tabela?",
+      "expected_intent": "tabular_distinct",
+      "expected_dimension": "estado"
+    },
+    {
+      "question": "Quais sao as colunas da tabela?",
+      "expected_intent": "tabular_schema"
+    },
+    {
+      "question": "O que significa a coluna score_credito?",
+      "expected_intent": "tabular_describe_column"
+    },
+    {
+      "question": "Compare SP e RJ em renda media",
+      "expected_intent": "tabular_compare",
+      "expected_metric": "renda_mensal",
+      "expected_unit": "brl"
+    }
+  ]
+}

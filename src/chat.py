@@ -14,6 +14,8 @@ from src.guardrails import detect_injection, sanitize_context_chunk, sanitize_hi
 from src.lexical import normalize_query_numerals
 from src.observability import metrics
 from src.prompts import build_rag_messages, format_context, get_rag_system
+from src.table_renderer import render_table_answer
+from src.table_semantics import aggregation_lead_text, infer_subject_label, render_value_by_unit
 from src.utils import get_logger, log_event
 
 logger = get_logger(__name__)
@@ -141,7 +143,8 @@ _CHAPTER_REF_RE = re.compile(r"\bcapitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECA
 _TITLE_REF_RE = re.compile(r"\btitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
 _SECTION_REF_RE = re.compile(r"\bsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
 _SUBSECTION_REF_RE = re.compile(r"\bsubsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
-_ARTICLE_REF_RE = re.compile(r"\bart(?:igo)?\.?\s*([0-9]{1,4})\b", re.IGNORECASE)
+_ARTICLE_REF_RE = re.compile(r"\bart(?:igo)?\.?\s*([0-9]{1,4})(?:[º°o])?\b", re.IGNORECASE)
+_ARTICLE_BLOCK_RE = re.compile(r"\bArt\.?\s*(\d{1,4})(?:[º°o])?\b", re.IGNORECASE)
 
 _NODE_META_KEYS: dict[str, tuple[str, ...]] = {
     "titulo": ("titulo", "title"),
@@ -164,6 +167,11 @@ def _extract_chapter_refs(question: str) -> set[str]:
     for match in _CHAPTER_REF_RE.finditer(expanded):
         refs.add(match.group(1).lower())
     return refs
+
+
+def _extract_article_refs(question: str) -> set[str]:
+    expanded = _normalize_for_match(normalize_query_numerals(question))
+    return {match.group(1).lower() for match in _ARTICLE_REF_RE.finditer(expanded)}
 
 
 def _extract_structural_targets(question: str) -> list[tuple[str, set[str]]]:
@@ -198,15 +206,15 @@ def _expand_refs_arabic_roman(refs: set[str]) -> set[str]:
 
     E.g., {"2"} â†’ {"2", "ii"}, {"ii"} â†’ {"ii", "2"}, {"iv"} â†’ {"iv", "4"}
     """
-    from src.lexical import _int_to_roman, _roman_to_int
+    from src.lexical import int_to_roman, roman_to_int
     expanded = set(refs)
     for ref in refs:
         if ref.isdigit():
             n = int(ref)
             if 1 <= n <= 3999:
-                expanded.add(_int_to_roman(n).lower())
+                expanded.add(int_to_roman(n).lower())
         elif ref.isalpha():
-            n = _roman_to_int(ref.upper())
+            n = roman_to_int(ref.upper())
             if n > 0:
                 expanded.add(str(n))
     return expanded
@@ -906,6 +914,227 @@ def _merge_structured_vector(structured: list[dict], vector: list[dict], top_k: 
     return ranked[:top_k]
 
 
+def _format_numeric_value(value) -> str:
+    if value is None:
+        return "sem resultado"
+    try:
+        num = float(value)
+    except Exception:
+        return str(value)
+    return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _format_count_value(value) -> str:
+    if value is None:
+        return "0"
+    try:
+        return str(int(round(float(value))))
+    except Exception:
+        return str(value)
+
+
+def _humanize_identifier(value: str) -> str:
+    return str(value or "").replace("_", " ").strip()
+
+
+def _humanize_plural_identifier(value: str) -> str:
+    text = _humanize_identifier(value)
+    if not text:
+        return text
+    return text if text.endswith("s") else f"{text}s"
+
+
+def _get_collection_context_hint(workspace_id: str, collection: str) -> str:
+    from src import controlplane
+
+    try:
+        return controlplane.get_collection_context(workspace_id, collection)
+    except Exception:
+        return ""
+
+
+def _build_table_query_summary(plan: dict) -> str:
+    sql_generated = str(plan.get("sql_generated") or "").strip()
+    if sql_generated:
+        return sql_generated
+    op = str(plan.get("operation", ""))
+    agg = str(plan.get("aggregation", "")).upper()
+    metric = str(plan.get("metric_column") or "*")
+    filters = plan.get("filters", []) or []
+    group_by = plan.get("group_by", []) or []
+    where_clause = " AND ".join(f"{flt['column']} = '{flt['value']}'" for flt in filters) if filters else "1=1"
+    if op == "aggregate":
+        expr = "COUNT(*)" if agg == "COUNT" or metric == "*" else f"{agg}({metric})"
+        return f"SELECT {expr} FROM tabela WHERE {where_clause}"
+    if op == "groupby":
+        groups = ", ".join(group_by)
+        expr = "COUNT(*)" if agg == "COUNT" or metric == "*" else f"{agg}({metric})"
+        return f"SELECT {groups}, {expr} FROM tabela WHERE {where_clause} GROUP BY {groups} ORDER BY 2 DESC"
+    if op == "rank":
+        return f"SELECT ... FROM tabela WHERE {where_clause} ORDER BY {metric} DESC LIMIT {int(plan.get('limit') or 10)}"
+    if op == "distinct":
+        dimension = str(plan.get("dimension_column") or "*")
+        return f"SELECT DISTINCT {dimension} FROM tabela WHERE {where_clause} ORDER BY {dimension} ASC"
+    if op == "schema":
+        return "SHOW COLUMNS FROM tabela"
+    if op == "describe_column":
+        return f"DESCRIBE COLUMN {str(plan.get('target_column') or '').strip()}"
+    return "Consulta analitica estruturada"
+
+
+def _describe_filters(filters: list[dict]) -> str:
+    if not filters:
+        return ""
+    parts = []
+    for flt in filters:
+        col = _humanize_identifier(flt.get("column", ""))
+        val = str(flt.get("value", "")).strip()
+        parts.append(f"{col} = {val}")
+    return ", ".join(parts)
+
+
+def _business_filter_phrase(filters: list[dict]) -> str:
+    if not filters:
+        return ""
+    parts = []
+    for flt in filters:
+        col = _humanize_identifier(flt.get("column", ""))
+        val = str(flt.get("value", "")).strip()
+        if col == "estado":
+            parts.append(f"no estado de {val}")
+        elif col == "cidade":
+            parts.append(f"na cidade de {val}")
+        else:
+            parts.append(f"com {col} = {val}")
+    return " e ".join(parts)
+
+
+def _table_result_preview(result: dict, plan: dict) -> str:
+    if result.get("operation") == "aggregate":
+        metric = _humanize_identifier(plan.get("metric_column") or "registros")
+        unit = str(plan.get("metric_unit") or ("count" if plan.get("aggregation") == "count" else "number"))
+        formatter = _format_count_value if plan.get("aggregation") == "count" else lambda value: render_value_by_unit(value, unit)
+        return f"resultado: {formatter(result.get('value'))}; metrica: {metric}; agregacao: {plan.get('aggregation', '')}"
+    if result.get("operation") == "distinct":
+        values = result.get("values", [])[:10]
+        return f"valores distintos ({result.get('count', len(values))}): " + ", ".join(str(v) for v in values)
+    if result.get("operation") == "schema":
+        cols = result.get("columns", [])[:20]
+        return f"colunas ({result.get('count', len(cols))}): " + ", ".join(str(v) for v in cols)
+    if result.get("operation") == "describe_column":
+        target = result.get("target_profile") or {}
+        if not target:
+            return "coluna nao encontrada"
+        return (
+            f"coluna: {target.get('name', '')}; tipo_semantico: {target.get('semantic_type', '')}; "
+            f"unidade: {target.get('unit', '')}; descricao: {target.get('description', '')}"
+        )
+    if result.get("operation") == "compare":
+        rows = result.get("rows", [])[:5]
+        return "; ".join(
+            ", ".join(f"{key}={value}" for key, value in row.items())
+            for row in rows
+        ) or "resultado: sem comparacao"
+    rows = result.get("rows", [])[:5]
+    if not rows:
+        return "resultado: sem linhas"
+    cols = [c for c in rows[0].keys()]
+    preview_lines = []
+    for row in rows:
+        preview_lines.append(" | ".join(f"{col}={row.get(col)}" for col in cols))
+    return "\n".join(preview_lines)
+
+
+def _answer_table_first(
+    *,
+    collection: str,
+    question: str,
+    request_id: str,
+    workspace_id: str = "default",
+) -> ChatResult | None:
+    from src.structured_store import execute_plan, has_structured_data, plan_query
+
+    settings = get_settings()
+    if not (getattr(settings, "query_routing_enabled", False) and getattr(settings, "structured_store_enabled", False)):
+        return None
+    if not has_structured_data(collection):
+        return None
+
+    context_hint = _get_collection_context_hint(workspace_id, collection)
+    plan = plan_query(collection, question, context_hint=context_hint)
+    if not plan:
+        return None
+    result = execute_plan(collection, plan)
+    if not result:
+        return None
+    if result.get("sql_generated"):
+        plan["sql_generated"] = result.get("sql_generated", "")
+
+    filters = plan.get("filters", [])
+    business_scope = _business_filter_phrase(filters)
+    answer, excerpt = render_table_answer(
+        question=question,
+        plan=plan,
+        result=result,
+        context_hint=context_hint,
+        business_scope=business_scope,
+    )
+
+    try:
+        from src import controlplane
+
+        controlplane.log_query_plan(
+            workspace_id=workspace_id,
+            collection=collection,
+            question=question,
+            planner_source=str(plan.get("planner_source") or "heuristic"),
+            plan=plan,
+            validated=bool(plan.get("validated", False)),
+            validation_errors=list(plan.get("validation_errors", []) or []),
+            sql_generated=str(result.get("sql_generated") or ""),
+        )
+    except Exception:
+        pass
+
+    log_event(
+        logger,
+        20,
+        "Table-first query answered",
+        request_id=request_id,
+        collection=collection,
+        operation=plan.get("operation", ""),
+        aggregation=plan.get("aggregation", ""),
+        metric=plan.get("metric_column", ""),
+        filters=filters,
+        planner_source=plan.get("planner_source", ""),
+    )
+    metrics.increment("chat.table_first.hit")
+    if plan.get("validated", False):
+        metrics.increment("chat.table_first.validated")
+    return ChatResult(
+        answer=answer,
+        sources=[
+            Source(
+                chunk_id=f"structured::{collection}::table_first",
+                doc_id="",
+                excerpt=excerpt[:400],
+                score=1.0,
+                metadata={
+                    "source": "structured_store",
+                    "source_kind": "table_query",
+                    "plan": plan,
+                    "result": result,
+                    "query_summary": _build_table_query_summary({**plan, "sql_generated": result.get("sql_generated", "")}),
+                    "result_preview": _table_result_preview(result, plan),
+                    "citation_label": "consulta analitica executada",
+                    "context_hint": context_hint,
+                },
+            )
+        ],
+        request_id=request_id,
+    )
+
+
 def _retrieve_with_routing(
     question: str,
     collection: str,
@@ -987,6 +1216,10 @@ def _retrieve_with_routing(
 # â”€â”€ Query intent classification (Gap 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class QueryIntent(Enum):
+    COUNT_STRUCTURAL = "count_structural"  # "quantos capitulos tem?"
+    LIST_STRUCTURAL = "list_structural"  # "quais secoes existem no capitulo v?"
+    LOCATE_STRUCTURAL = "locate_structural"  # "qual e o ultimo capitulo?"
+    CONTAINS_STRUCTURAL = "contains_structural"  # "o capitulo v tem secao iii?"
     SUMMARY_STRUCTURAL = "summary_structural"  # "resuma o capÃ­tulo 2"
     QUESTION_STRUCTURAL = "question_structural"  # "o que diz o capÃ­tulo 2?"
     QUESTION_FACTUAL = "question_factual"  # "Ã© proibido remunerar?"
@@ -1028,8 +1261,23 @@ def _classify_intent_regex(question: str) -> QueryIntent:
     has_summary = bool(
         re.search(r"\b(resum|sintetiz|explique|descrev|visao\s+(geral|executiva))", q_norm)
     )
+    has_count = bool(
+        re.search(r"\b(quantos|quantas|numero\s+de|qtd\.?)\b", q_norm)
+    )
+    has_list = bool(
+        re.search(r"\b(quais|liste|listar|lista|relacione)\b", q_norm)
+    )
+    has_locate = bool(
+        re.search(r"\b(onde\s+esta|onde\s+fica|ultimo|ultima|primeiro|primeira)\b", q_norm)
+    )
+    has_contains = bool(
+        re.search(r"\b(tem|possui|contem|inclui|ha|existe|existem)\b", q_norm)
+    )
     has_structural_ref = bool(
         re.search(r"\b(capitulo|secao|titulo|parte)\s+([ivxlcdm]+|\d{1,4})\b", q_norm)
+    )
+    has_structural_noun = bool(
+        re.search(r"\b(capitulo|capitulos|secao|secoes|titulo|titulos|artigo|artigos)\b", q_norm)
     )
     has_comparison = bool(
         re.search(r"\b(compar\w*|diferenca\s+entre|versus|vs\.?)\b", q_norm)
@@ -1037,6 +1285,14 @@ def _classify_intent_regex(question: str) -> QueryIntent:
 
     if has_summary and has_structural_ref:
         return QueryIntent.SUMMARY_STRUCTURAL
+    if has_count and has_structural_noun:
+        return QueryIntent.COUNT_STRUCTURAL
+    if has_list and has_structural_noun:
+        return QueryIntent.LIST_STRUCTURAL
+    if has_locate and has_structural_noun:
+        return QueryIntent.LOCATE_STRUCTURAL
+    if has_contains and len(_extract_structural_targets(q)) >= 2:
+        return QueryIntent.CONTAINS_STRUCTURAL
     if has_comparison and has_structural_ref:
         return QueryIntent.COMPARISON
     if has_structural_ref:
@@ -1051,6 +1307,26 @@ def _classify_intent_regex(question: str) -> QueryIntent:
 
 # Exemplar queries per intent â€” used as few-shot anchors for similarity
 _INTENT_EXEMPLARS: dict[QueryIntent, list[str]] = {
+    QueryIntent.COUNT_STRUCTURAL: [
+        "Quantos capitulos tem no estatuto?",
+        "Quantas secoes existem no capitulo V?",
+        "Numero de artigos do capitulo II",
+    ],
+    QueryIntent.LIST_STRUCTURAL: [
+        "Quais capitulos existem no estatuto?",
+        "Liste as secoes do capitulo V",
+        "Quais artigos estao no capitulo II?",
+    ],
+    QueryIntent.LOCATE_STRUCTURAL: [
+        "Qual e o ultimo capitulo?",
+        "Qual e a primeira secao do capitulo V?",
+        "Onde esta o capitulo VII?",
+    ],
+    QueryIntent.CONTAINS_STRUCTURAL: [
+        "O capitulo V tem secao III?",
+        "Existe art. 41 no capitulo X?",
+        "O titulo I contem capitulo II?",
+    ],
     QueryIntent.SUMMARY_STRUCTURAL: [
         "Resuma o capÃ­tulo II",
         "Sintetize a seÃ§Ã£o III",
@@ -1161,13 +1437,13 @@ def _resolve_structural_summary(
             search_terms.add(ref)
             search_terms.add(ref.upper())
             if ref.isdigit():
-                from src.lexical import _int_to_roman
+                from src.lexical import int_to_roman
 
-                search_terms.add(_int_to_roman(int(ref)))
+                search_terms.add(int_to_roman(int(ref)))
             elif ref.upper().isalpha():
-                from src.lexical import _roman_to_int
+                from src.lexical import roman_to_int
 
-                arabic = _roman_to_int(ref.upper())
+                arabic = roman_to_int(ref.upper())
                 if arabic > 0:
                     search_terms.add(str(arabic))
 
@@ -1312,6 +1588,523 @@ def _artifact_header_level(text: str) -> tuple[str, str] | None:
         m = re.search(rf"\b{prefix}\s+([ivxlcdm]+|\d{{1,4}})\b", normalized)
         if m:
             return node_type, m.group(1)
+    return None
+
+
+def _structural_level(node_type: str) -> int:
+    return {"titulo": 1, "capitulo": 2, "secao": 3, "subsecao": 4, "artigo": 5}.get(node_type, 99)
+
+
+def _detect_requested_structural_type(question: str) -> str | None:
+    q = _normalize_for_match(question)
+    for token, node_type in (
+        ("artigos", "artigo"),
+        ("artigo", "artigo"),
+        ("secoes", "secao"),
+        ("secao", "secao"),
+        ("capitulos", "capitulo"),
+        ("capitulo", "capitulo"),
+        ("titulos", "titulo"),
+        ("titulo", "titulo"),
+    ):
+        if token in q:
+            return node_type
+    return None
+
+
+def _extract_artifact_structures(blocks: list[dict]) -> list[dict]:
+    headers: list[dict] = []
+    for idx, block in enumerate(blocks):
+        text = str(block.get("text", "")).strip()
+        header = _artifact_header_level(text)
+        if not header:
+            continue
+        headers.append(
+            {
+                "start_idx": idx,
+                "node_type": header[0],
+                "numeral": header[1].upper(),
+                "label": text.splitlines()[0].strip(),
+                "page_start": block.get("page_number"),
+            }
+        )
+
+    structures: list[dict] = []
+    for pos, header in enumerate(headers):
+        end_idx = len(blocks)
+        current_level = _structural_level(header["node_type"])
+        for next_header in headers[pos + 1:]:
+            if _structural_level(next_header["node_type"]) <= current_level:
+                end_idx = next_header["start_idx"]
+                break
+
+        parts: list[str] = []
+        articles: list[str] = []
+        for block in blocks[header["start_idx"]:end_idx]:
+            text = str(block.get("text", "")).strip()
+            if not text:
+                continue
+            parts.append(text)
+            for article in re.findall(r"Art\.?\s*(\d+)", text, re.IGNORECASE):
+                label = f"Art. {article}"
+                if label not in articles:
+                    articles.append(label)
+
+        structures.append(
+            {
+                **header,
+                "end_idx": end_idx,
+                "page_end": blocks[end_idx - 1].get("page_number") if end_idx > header["start_idx"] else header.get("page_start"),
+                "text": "\n\n".join(parts).strip(),
+                "articles": articles,
+            }
+        )
+    return structures
+
+
+def _extract_artifact_articles(blocks: list[dict]) -> list[dict]:
+    articles: list[dict] = []
+    current_article: dict | None = None
+    current_context = {"titulo": "", "capitulo": "", "secao": ""}
+
+    def _flush() -> None:
+        nonlocal current_article
+        if not current_article:
+            return
+        parts = current_article.pop("parts", [])
+        current_article["text"] = "\n\n".join(part for part in parts if part).strip()
+        articles.append(current_article)
+        current_article = None
+
+    for idx, block in enumerate(blocks):
+        text = str(block.get("text", "")).strip()
+        if not text:
+            continue
+
+        header = _artifact_header_level(text)
+        if header:
+            _flush()
+            current_context[header[0]] = text.splitlines()[0].strip()
+            lower_level = _structural_level(header[0])
+            if lower_level <= _structural_level("capitulo"):
+                current_context["secao"] = ""
+
+        article_match = _ARTICLE_BLOCK_RE.search(text)
+        if article_match:
+            _flush()
+            article_number = article_match.group(1)
+            current_article = {
+                "start_idx": idx,
+                "end_idx": idx + 1,
+                "article_number": article_number,
+                "label": f"Art. {article_number}",
+                "page_start": block.get("page_number"),
+                "page_end": block.get("page_number"),
+                "titulo": current_context.get("titulo", ""),
+                "capitulo": current_context.get("capitulo", ""),
+                "secao": current_context.get("secao", ""),
+                "parts": [text],
+            }
+            continue
+
+        if current_article:
+            current_article["parts"].append(text)
+            current_article["end_idx"] = idx + 1
+            current_article["page_end"] = block.get("page_number") or current_article.get("page_end")
+
+    _flush()
+    return [article for article in articles if article.get("text")]
+
+
+def _find_structure_scope(
+    structures: list[dict],
+    question: str,
+) -> dict | None:
+    targets = _extract_structural_targets(question)
+    if not targets:
+        return None
+    for node_type, refs in targets:
+        expanded_refs = _expand_refs_arabic_roman(refs)
+        for item in structures:
+            if item["node_type"] != node_type:
+                continue
+            if _expand_refs_arabic_roman({item["numeral"].lower()}) & expanded_refs:
+                return item
+    return None
+
+
+def _find_exact_article_scope(blocks: list[dict], question: str) -> dict | None:
+    article_refs = _extract_article_refs(question)
+    if not article_refs:
+        return None
+    for article in _extract_artifact_articles(blocks):
+        if article.get("article_number", "").lower() in article_refs:
+            return article
+    return None
+
+
+def _find_contains_structural_pair(question: str) -> tuple[tuple[str, set[str]], tuple[str, set[str]]] | None:
+    targets = _extract_structural_targets(question)
+    if len(targets) < 2:
+        return None
+
+    typed = [(node_type, refs, _structural_level(node_type)) for node_type, refs in targets]
+    typed = [item for item in typed if item[2] < 99]
+    if len(typed) < 2:
+        return None
+
+    typed.sort(key=lambda item: item[2])
+    parent_type, parent_refs, _ = typed[0]
+    child_type, child_refs, _ = typed[-1]
+    return (parent_type, parent_refs), (child_type, child_refs)
+
+
+def _structure_is_within_scope(item: dict, scope: dict) -> bool:
+    return (
+        item["start_idx"] > scope["start_idx"]
+        and item["start_idx"] < scope.get("end_idx", 10**9)
+        and _structural_level(item["node_type"]) > _structural_level(scope["node_type"])
+    )
+
+
+def _answer_contains_structure(
+    *,
+    question: str,
+    doc_label: str,
+    structures: list[dict],
+) -> tuple[str, dict] | None:
+    pair = _find_contains_structural_pair(question)
+    if not pair:
+        return None
+    (parent_type, parent_refs), (child_type, child_refs) = pair
+
+    parent_scope = None
+    for item in structures:
+        if item["node_type"] != parent_type:
+            continue
+        if _expand_refs_arabic_roman({item["numeral"].lower()}) & _expand_refs_arabic_roman(parent_refs):
+            parent_scope = item
+            break
+    if not parent_scope:
+        return (
+            f"Nao encontrei {parent_type} {next(iter(parent_refs), '')} no documento {doc_label}.",
+            {"doc_label": doc_label, "requested_type": child_type},
+        )
+
+    if child_type == "artigo":
+        normalized_articles = {
+            re.search(r"(\d+)", label).group(1): label
+            for label in parent_scope.get("articles", [])
+            if re.search(r"(\d+)", label)
+        }
+        for ref in child_refs:
+            if ref in normalized_articles:
+                label = normalized_articles[ref]
+                return (
+                    f"Sim. {parent_scope['label']} contem {label}.",
+                    {
+                        "doc_label": doc_label,
+                        "scope": parent_scope["label"],
+                        "requested_type": child_type,
+                        "child_label": label,
+                    },
+                )
+        return (
+            f"Nao. {parent_scope['label']} nao contem o artigo solicitado.",
+            {"doc_label": doc_label, "scope": parent_scope["label"], "requested_type": child_type},
+        )
+
+    candidates = [
+        item for item in structures
+        if item["node_type"] == child_type and _structure_is_within_scope(item, parent_scope)
+    ]
+    expanded_child_refs = _expand_refs_arabic_roman(child_refs)
+    for item in candidates:
+        if _expand_refs_arabic_roman({item["numeral"].lower()}) & expanded_child_refs:
+            return (
+                f"Sim. {parent_scope['label']} contem {item['label']}.",
+                {
+                    "doc_label": doc_label,
+                    "scope": parent_scope["label"],
+                    "requested_type": child_type,
+                    "child_label": item["label"],
+                    "node_type": item["node_type"],
+                    "page_number": item.get("page_start"),
+                },
+            )
+
+    child_ref = next(iter(child_refs), "")
+    return (
+        f"Nao. {parent_scope['label']} nao contem {child_type} {child_ref.upper()}.",
+        {"doc_label": doc_label, "scope": parent_scope["label"], "requested_type": child_type},
+    )
+
+
+def _build_structure_answer_text(
+    *,
+    intent: QueryIntent,
+    requested_type: str,
+    doc_label: str,
+    structures: list[dict],
+    scope: dict | None,
+) -> tuple[str, dict]:
+    target_items = [s for s in structures if s["node_type"] == requested_type]
+    meta: dict = {"doc_label": doc_label}
+
+    if intent == QueryIntent.COUNT_STRUCTURAL:
+        if scope:
+            if requested_type == "artigo":
+                count = len(scope.get("articles", []))
+            else:
+                count = len(
+                    [
+                        s for s in structures
+                        if s["node_type"] == requested_type
+                        and s["start_idx"] > scope["start_idx"]
+                        and s["start_idx"] < scope.get("end_idx", 10**9)
+                        and _structural_level(s["node_type"]) > _structural_level(scope["node_type"])
+                    ]
+                )
+            text = f"{scope['label']} possui {count} {requested_type}(s)."
+            meta["scope"] = scope["label"]
+            return text, meta
+
+        count = len(target_items)
+        text = f"O documento {doc_label} possui {count} {requested_type}(s)."
+        if target_items:
+            text += f" Vai de {target_items[0]['label']} ate {target_items[-1]['label']}."
+        return text, meta
+
+    if intent == QueryIntent.LIST_STRUCTURAL:
+        if requested_type == "artigo" and scope:
+            articles = scope.get("articles", [])
+            meta["scope"] = scope["label"]
+            if not articles:
+                return f"Nao encontrei artigos explicitamente marcados dentro de {scope['label']}.", meta
+            listed = ", ".join(articles[:30])
+            return f"{scope['label']} cobre os seguintes artigos: {listed}.", meta
+
+        if scope:
+            child_level = _structural_level(requested_type)
+            scope_level = _structural_level(scope["node_type"])
+            scoped_items = [
+                s for s in structures
+                if s["node_type"] == requested_type
+                and s["start_idx"] > scope["start_idx"]
+                and s["start_idx"] < scope.get("end_idx", 10**9)
+                and child_level > scope_level
+            ]
+            labels = [s["label"] for s in scoped_items[:20]]
+            meta["scope"] = scope["label"]
+            if not labels:
+                return f"Nao encontrei {requested_type}(s) dentro de {scope['label']}.", meta
+            return f"{scope['label']} contem {len(scoped_items)} {requested_type}(s): " + "; ".join(labels) + ".", meta
+
+        labels = [s["label"] for s in target_items[:30]]
+        if not labels:
+            return f"Nao encontrei {requested_type}(s) no documento {doc_label}.", meta
+        return f"O documento {doc_label} contem {len(target_items)} {requested_type}(s): " + "; ".join(labels) + ".", meta
+
+    return "", meta
+
+
+def _answer_structure_first(
+    *,
+    collection: str,
+    question: str,
+    request_id: str,
+    intent: QueryIntent,
+    workspace_id: str,
+) -> ChatResult | None:
+    from src import controlplane
+
+    requested_type = _detect_requested_structural_type(question)
+    if intent != QueryIntent.CONTAINS_STRUCTURAL and not requested_type:
+        return None
+
+    documents = controlplane.list_documents(workspace_id, collection)
+    for doc in documents:
+        artifact = _resolve_processed_json(doc.doc_id, doc.filename)
+        if not artifact:
+            continue
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        blocks = data.get("blocks", [])
+        if not isinstance(blocks, list) or not blocks:
+            continue
+        structures = _extract_artifact_structures(blocks)
+        if not structures:
+            continue
+
+        if intent == QueryIntent.CONTAINS_STRUCTURAL:
+            contains_result = _answer_contains_structure(
+                question=question,
+                doc_label=doc.filename,
+                structures=structures,
+            )
+            if not contains_result:
+                continue
+            text, meta = contains_result
+            source = Source(
+                chunk_id=f"artifact::{doc.doc_id}::contains",
+                doc_id=doc.doc_id,
+                excerpt=meta.get("scope", doc.filename),
+                score=1.0,
+                metadata=meta,
+            )
+            log_event(
+                logger,
+                20,
+                "Structure-first contains query answered",
+                request_id=request_id,
+                collection=collection,
+                intent=intent.value,
+                doc_id=doc.doc_id,
+                scope=meta.get("scope", ""),
+                child_label=meta.get("child_label", ""),
+            )
+            metrics.increment("chat.structure_first.hit")
+            return ChatResult(answer=text, sources=[source], request_id=request_id)
+
+        scope = _find_structure_scope(structures, question)
+        if intent == QueryIntent.LOCATE_STRUCTURAL:
+            q_norm = _normalize_for_match(question)
+            candidates = [s for s in structures if s["node_type"] == requested_type]
+            if "ultimo" in q_norm or "ultima" in q_norm:
+                scope = candidates[-1] if candidates else None
+            elif "primeiro" in q_norm or "primeira" in q_norm:
+                scope = candidates[0] if candidates else None
+            if scope:
+                answer = f"{scope['label']} aparece na pagina {scope.get('page_start') or '?'} do documento {doc.filename}."
+                source = Source(
+                    chunk_id=f"artifact::{doc.doc_id}::{scope['node_type']}::{scope['numeral']}",
+                    doc_id=doc.doc_id,
+                    excerpt=scope["label"],
+                    score=1.0,
+                    metadata={"node_type": scope["node_type"], "label": scope["label"], "page_number": scope.get("page_start")},
+                )
+                metrics.increment("chat.structure_first.hit")
+                return ChatResult(answer=answer, sources=[source], request_id=request_id)
+
+        text, meta = _build_structure_answer_text(
+            intent=intent,
+            requested_type=requested_type,
+            doc_label=doc.filename,
+            structures=structures,
+            scope=scope,
+        )
+        if not text:
+            continue
+        source_meta = {"requested_type": requested_type, **meta}
+        if scope:
+            source_meta.update({"node_type": scope["node_type"], "label": scope["label"], "page_number": scope.get("page_start")})
+        source = Source(
+            chunk_id=f"artifact::{doc.doc_id}::{requested_type}",
+            doc_id=doc.doc_id,
+            excerpt=(scope["label"] if scope else doc.filename),
+            score=1.0,
+            metadata=source_meta,
+        )
+        log_event(
+            logger,
+            20,
+            "Structure-first query answered",
+            request_id=request_id,
+            collection=collection,
+            intent=intent.value,
+            requested_type=requested_type,
+            doc_id=doc.doc_id,
+            scope=(scope["label"] if scope else ""),
+        )
+        metrics.increment("chat.structure_first.hit")
+        return ChatResult(answer=text, sources=[source], request_id=request_id)
+
+    metrics.increment("chat.structure_first.miss")
+    return None
+
+
+def _answer_exact_article_from_artifact(
+    *,
+    collection: str,
+    question: str,
+    history: list[ChatMessage] | None,
+    request_id: str,
+    workspace_id: str,
+    profile_name: str,
+) -> ChatResult | None:
+    from src import controlplane
+
+    article_refs = _extract_article_refs(question)
+    if not article_refs:
+        return None
+
+    documents = controlplane.list_documents(workspace_id, collection)
+    for doc in documents:
+        artifact = _resolve_processed_json(doc.doc_id, doc.filename)
+        if not artifact:
+            continue
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        blocks = data.get("blocks", [])
+        if not isinstance(blocks, list) or not blocks:
+            continue
+
+        article = _find_exact_article_scope(blocks, question)
+        if not article:
+            continue
+
+        context = format_context(
+            [
+                {
+                    "id": f"artifact::{doc.doc_id}::artigo::{article['article_number']}",
+                    "text": article["text"],
+                    "score": 1.0,
+                    "metadata": {
+                        "doc_id": doc.doc_id,
+                        "artigo": article["label"],
+                        "capitulo": article.get("capitulo", ""),
+                        "secao": article.get("secao", ""),
+                        "page_number": article.get("page_start"),
+                        "chunk_type": "artifact_article",
+                    },
+                }
+            ]
+        )
+        messages: list[dict] = [{"role": msg.role, "content": msg.content} for msg in (history or [])]
+        messages.extend(build_rag_messages(context=context, question=question))
+        answer_text = llm.chat(messages, system=get_rag_system(profile_name))
+
+        source = Source(
+            chunk_id=f"artifact::{doc.doc_id}::artigo::{article['article_number']}",
+            doc_id=doc.doc_id,
+            excerpt=article["text"][:400],
+            score=1.0,
+            metadata={
+                "node_type": "artigo",
+                "artigo": article["label"],
+                "capitulo": article.get("capitulo", ""),
+                "secao": article.get("secao", ""),
+                "page_number": article.get("page_start"),
+            },
+        )
+        log_event(
+            logger,
+            20,
+            "Exact article resolved from processed artifact",
+            request_id=request_id,
+            collection=collection,
+            doc_id=doc.doc_id,
+            artigo=article["label"],
+            capitulo=article.get("capitulo", ""),
+        )
+        metrics.increment("chat.article_exact.hit")
+        return ChatResult(answer=answer_text, sources=[source], request_id=request_id)
+
+    metrics.increment("chat.article_exact.miss")
     return None
 
 
@@ -1541,6 +2334,47 @@ def answer(
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified", intent=intent.value, request_id=request_id)
     metrics.increment(f"chat.intent.{intent.value}")
+
+    table_result = _answer_table_first(
+        collection=collection,
+        question=question,
+        request_id=request_id,
+        workspace_id=workspace_id,
+    )
+    if table_result:
+        return table_result
+
+    if intent in {
+        QueryIntent.COUNT_STRUCTURAL,
+        QueryIntent.LIST_STRUCTURAL,
+        QueryIntent.LOCATE_STRUCTURAL,
+        QueryIntent.CONTAINS_STRUCTURAL,
+    }:
+        structure_result = _answer_structure_first(
+            collection=collection,
+            question=question,
+            request_id=request_id,
+            intent=intent,
+            workspace_id=workspace_id,
+        )
+        if structure_result:
+            return structure_result
+
+    if _extract_article_refs(question) and intent in {
+        QueryIntent.QUESTION_STRUCTURAL,
+        QueryIntent.LOCATE_EXCERPT,
+        QueryIntent.QUESTION_FACTUAL,
+    }:
+        article_result = _answer_exact_article_from_artifact(
+            collection=collection,
+            question=question,
+            history=history,
+            request_id=request_id,
+            workspace_id=workspace_id,
+            profile_name=profile_name,
+        )
+        if article_result:
+            return article_result
 
     if intent == QueryIntent.SUMMARY_STRUCTURAL:
         summary = _resolve_structural_summary(question, collection, workspace_id)
@@ -1813,6 +2647,47 @@ def prepare_stream(
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified",
               intent=intent.value, request_id=request_id)
+
+    table_result = _answer_table_first(
+        collection=collection,
+        question=question,
+        request_id=request_id,
+        workspace_id=workspace_id,
+    )
+    if table_result:
+        return table_result
+
+    if intent in {
+        QueryIntent.COUNT_STRUCTURAL,
+        QueryIntent.LIST_STRUCTURAL,
+        QueryIntent.LOCATE_STRUCTURAL,
+        QueryIntent.CONTAINS_STRUCTURAL,
+    }:
+        structure_result = _answer_structure_first(
+            collection=collection,
+            question=question,
+            request_id=request_id,
+            intent=intent,
+            workspace_id=workspace_id,
+        )
+        if structure_result:
+            return structure_result
+
+    if _extract_article_refs(question) and intent in {
+        QueryIntent.QUESTION_STRUCTURAL,
+        QueryIntent.LOCATE_EXCERPT,
+        QueryIntent.QUESTION_FACTUAL,
+    }:
+        article_result = _answer_exact_article_from_artifact(
+            collection=collection,
+            question=question,
+            history=history,
+            request_id=request_id,
+            workspace_id=workspace_id,
+            profile_name=profile_name,
+        )
+        if article_result:
+            return article_result
 
     if intent == QueryIntent.SUMMARY_STRUCTURAL:
         summary = _resolve_structural_summary(question, collection, workspace_id)

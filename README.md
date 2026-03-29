@@ -96,7 +96,10 @@ FAISS_HNSW_EF_SEARCH=64
 - **Arvore juridica canonica**: representacao JSON hierarquica (titulo > capitulo > secao > artigo > paragrafo > inciso)
 - **Indice macro por capitulo/secao**: capitulos e secoes indexados como chunks especiais no FAISS
 - **Resumos pre-computados por capitulo**: resumo executivo, juridico, pontos-chave, obrigacoes, restricoes e definicoes via LLM
-- **Roteador de intencao**: classifica queries em `summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`
+- **Roteador de intencao**: classifica queries em `count_structural`, `list_structural`, `locate_structural`, `contains_structural`, `summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`
+- **Structure-first automatico para navegacao documental**: perguntas como "quantos capitulos tem?", "quais artigos estao no capitulo II?" e "o capitulo V tem secao III?" sao respondidas direto pela estrutura da Prata, sem depender do vetor
+- **Table-first para planilhas e CSV**: perguntas analiticas como "qual e a renda do estado do Rio de Janeiro?" sao planejadas e executadas no store estruturado antes da RAG textual
+- **Fontes analiticas explicitas**: quando a resposta vem de consulta tabular, a interface mostra a consulta analitica executada e um resumo do resultado em vez de top 5 trechos
 - **Shortcut para sumarizacao estrutural**: "resuma o capitulo X" usa resumo pre-computado quando existir; se nao existir, resolve o escopo direto pelo artefato JSON da Prata e gera resumo on-demand
 - **Fallback deterministico para summary**: se o LLM falhar ou devolver JSON invalido, o sistema gera um resumo extrativo local (`fallback_only`) em vez de falhar
 - **Limpeza estrutural pesada**: merge de linhas quebradas, deduplicacao de paragrafos, remocao de numeros de pagina orfaos
@@ -118,7 +121,9 @@ Navegador (UI embutida ou React)
    v
 FastAPI (app.py)
    |--- Chat (hibrido + reranking + streaming SSE)
-   |    |--- Roteador de intencao (summary_structural / question / locate / comparison)
+   |    |--- Table-first: agregacao/group-by/ranking em DuckDB/SQLite para planilhas e CSV
+   |    |--- Roteador de intencao (count / list / locate / contains / summary / question / comparison)
+   |    |--- Structure-first: contagem, inventario, localizacao e composicao estrutural via artefato JSON da Prata
    |    |--- Shortcut: resumo pre-computado (quando summary_structural)
    |    |--- Fallback estrutural: artefato JSON da Prata -> resolve capitulo/secao/titulo -> summary on-demand
    |    |--- Pipeline padrao: retrieval + reranking + geracao (demais intencoes)
@@ -279,18 +284,110 @@ O sistema classifica cada pergunta antes de decidir o pipeline:
 
 | Intencao | Exemplo | Pipeline |
 |----------|---------|----------|
+| `count_structural` | "Quantos capitulos tem no estatuto?" | Structure-first via artefato JSON da Prata |
+| `list_structural` | "Quais artigos estao no Capitulo II?" | Structure-first com inventario por escopo |
+| `locate_structural` | "Qual e o ultimo capitulo?" | Structure-first com localizacao por pagina/ordem |
+| `contains_structural` | "O Capitulo V tem Secao III?" | Structure-first com validacao pai-filho |
 | `summary_structural` | "Resuma o Capitulo II" | Resumo pre-computado + chunks de suporte |
 | `question_structural` | "O que diz o Capitulo II?" | Retrieval focado no capitulo |
 | `question_factual` | "E proibido remunerar?" | Retrieval hibrido padrao |
 | `locate_excerpt` | "Art. 41" | Retrieval com boost estrutural |
 | `comparison` | "Compare capitulo 1 e 2" | Retrieval multi-capitulo |
 
+Quando uma intent `structure-first` e detectada (`count/list/locate/contains`), a resposta sai diretamente do artefato JSON da Prata, usando os blocos `section_header` e a ordem do documento como fonte de verdade.
+
 Quando `summary_structural` e detectado, a ordem de preferencia e:
 1. resumo persistido em `document_summaries`
 2. resolucao direta do escopo no artefato JSON da Prata (`section_header`)
 3. summary on-demand por escopo com fallback extrativo local
 
-Isso elimina a dependencia exclusiva de retrieval fragmentado para perguntas como "Resuma o Capitulo II".
+Isso elimina a dependencia exclusiva de retrieval fragmentado para perguntas como "Resuma o Capitulo II" e tambem cobre inventario/composicao estrutural com alta confiabilidade.
+
+## Table-first para Planilhas
+
+Quando a colecao possui dados tabulares estruturados, o chat tenta resolver perguntas analiticas antes da RAG textual.
+
+Exemplos:
+- "Qual e a renda do estado do Rio de Janeiro?"
+- "Qual a media por estado?"
+- "Top 10 clientes por renda"
+- "Quais sao os estados UF da tabela?"
+- "Quais sao as colunas da tabela?"
+- "O que significa a coluna score_credito?"
+- "Compare SP e RJ em renda media"
+
+Fluxo:
+1. identificar que a pergunta e tabular/analitica
+2. carregar o perfil semantico da base (`table_profile`, `column_profiles`, `value_catalog`)
+3. gerar um plano estruturado (`intent`, `metric_column`, `aggregation`, `filters`, `group_by`, `expected_unit`)
+4. validar semanticamente o plano antes da execucao
+5. construir SQL seguro de forma deterministica
+6. executar a consulta no store estruturado (`DuckDB` ou fallback `SQLite`)
+7. renderizar a resposta com unidade correta (`R$`, `anos`, inteiro, lista, schema)
+8. exibir no card a consulta analitica executada e um resumo do resultado
+
+Quando a resposta vem de `table-first`, a interface nao trata o resultado como "5 fontes consultadas". Em vez disso, mostra:
+- `consulta analitica executada`
+- SQL auditavel da operacao
+- preview resumido do resultado tabular
+
+No frontend, a aba de ingestao tambem expõe a **inspecao semantica da base**:
+- `table_profile` da colecao
+- `column_profiles` com tipo fisico, tipo semantico, unidade, aliases e operacoes permitidas
+- resumo do benchmark tabular
+
+### Arquitetura Semantica Tabular
+
+A camada de planilhas/tabelas foi evoluida para um fluxo `schema-first` e `LLM-last`:
+
+1. **Table profile layer**
+   - persiste contexto da base, nome da tabela e sujeito de negocio
+2. **Semantic catalog**
+   - classifica cada coluna com:
+     - `physical_type`
+     - `semantic_type`
+     - `role`
+     - `unit`
+     - `aliases`
+     - `examples`
+     - `allowed_operations`
+3. **Planner estruturado**
+   - produz intents como:
+     - `tabular_aggregate`
+     - `tabular_count`
+     - `tabular_groupby`
+     - `tabular_rank`
+     - `tabular_distinct`
+     - `tabular_schema`
+     - `tabular_describe_column`
+4. **Validator**
+   - impede agregacoes incoerentes, como idade sendo renderizada como moeda
+5. **SQL builder**
+   - gera SQL seguro a partir do plano validado
+6. **Semantic renderer**
+   - transforma o resultado em resposta de negocio com unidade correta
+
+### Persistencia de Metadados Tabulares
+
+O control plane SQLite agora persiste:
+- `table_profiles`
+- `column_profiles`
+- `value_catalog`
+- `query_plans_log`
+
+Isso permite auditoria, evolucao incremental do planner e benchmark tabular sem depender da RAG textual.
+
+### Benchmark Tabular
+
+Existe um benchmark tabular dedicado com dataset ouro em `data/eval/tabular_gold_dataset.json`, cobrindo casos como:
+- agregacao por estado
+- contagem com filtros
+- distinct de UF
+- schema da tabela
+- descricao semantica de coluna
+- comparacao executiva entre grupos
+
+O endpoint `/evaluation/tabular` expõe esse snapshot para acompanhamento da qualidade do planner semântico.
 
 ## Limpeza Estrutural
 
@@ -371,22 +468,23 @@ Sem reindexacao, a base pode manter vetores antigos e degradar recall/precisao d
 1. Resolver workspace e collection fisica
 2. Validar e sanitizar question + history
 3. Detectar prompt injection
-4. **Classificar intencao da query** (`summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`)
-5. **Se `summary_structural`**: buscar resumo persistido no SQLite
-6. **Se nao encontrar**: tentar resolver `titulo/capitulo/secao` direto no artefato JSON da Prata
-7. **Se encontrar escopo**: gerar summary on-demand (LLM ou fallback extrativo) → montar contexto com resumo + chunks de suporte → retornar
-8. Classificar query (literal vs conceitual) para pesos dinamicos
-9. Embed query
-10. Busca vetorial + BM25 com fetch window 3x
-11. Fusao RRF com pesos dinamicos
-12. Reranking deterministico (lexical + metadata)
-13. Cross-encoder reranking (opcional, `CROSS_ENCODER_ENABLED=true`)
-14. Combinar score vetorial + score cross-encoder normalizado (0..1)
-15. Expansao de contexto juridico (parent + siblings + referencias)
-16. Resgate estrutural por metadados para "capitulo/secao/artigo"
-17. Sanitizar contexto recuperado
-18. Gerar resposta com LLM usando perfil de dominio
-19. Garantir presenca de citacao [N]
+4. **Classificar intencao da query** (`count_structural`, `list_structural`, `locate_structural`, `contains_structural`, `summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`)
+5. **Se `count/list/locate/contains_structural`**: resolver pela estrutura do artefato JSON da Prata e responder sem passar pela busca vetorial
+6. **Se `summary_structural`**: buscar resumo persistido no SQLite
+7. **Se nao encontrar**: tentar resolver `titulo/capitulo/secao` direto no artefato JSON da Prata
+8. **Se encontrar escopo**: gerar summary on-demand (LLM ou fallback extrativo) → montar contexto com resumo + chunks de suporte → retornar
+9. Classificar query (literal vs conceitual) para pesos dinamicos
+10. Embed query
+11. Busca vetorial + BM25 com fetch window 3x
+12. Fusao RRF com pesos dinamicos
+13. Reranking deterministico (lexical + metadata)
+14. Cross-encoder reranking (opcional, `CROSS_ENCODER_ENABLED=true`)
+15. Combinar score vetorial + score cross-encoder normalizado (0..1)
+16. Expansao de contexto juridico (parent + siblings + referencias)
+17. Resgate estrutural por metadados para "capitulo/secao/artigo"
+18. Sanitizar contexto recuperado
+19. Gerar resposta com LLM usando perfil de dominio
+20. Garantir presenca de citacao [N]
 
 Streaming via `POST /chat/message/stream` (SSE).
 

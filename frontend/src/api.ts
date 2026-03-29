@@ -28,6 +28,9 @@ export interface Source {
   page_number?: number | null
   source_filename?: string
   citation_label?: string
+  source_kind?: string
+  query_summary?: string
+  result_preview?: string
 }
 
 export interface Message {
@@ -58,6 +61,7 @@ export interface DocumentRecord {
   status: string
   chunks_indexed: number
   error: string
+  context_hint: string
   created_at: string
   updated_at: string
 }
@@ -86,6 +90,46 @@ export interface DocumentArtifacts {
   markdown_preview: string
   json_preview: string
   available: boolean
+}
+
+export interface TableProfile {
+  workspace_id: string
+  collection: string
+  table_name: string
+  base_context: string
+  subject_label: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ColumnProfile {
+  workspace_id: string
+  collection: string
+  column_name: string
+  display_name: string
+  physical_type: string
+  semantic_type: string
+  role: string
+  unit: string
+  aliases: string[]
+  examples: string[]
+  description: string
+  cardinality: number
+  allowed_operations: string[]
+}
+
+export interface CollectionSemanticProfile {
+  collection: string
+  profile: TableProfile | null
+  columns: ColumnProfile[]
+}
+
+export interface TabularEvaluation {
+  cases: number
+  summary: Record<string, number>
+  details: Array<Record<string, unknown>>
+  dataset?: string
+  context_hint?: string
 }
 
 export interface Workspace {
@@ -240,11 +284,12 @@ export const api = {
     }
   },
 
-  ingestDocument: (collection: string, embeddingModel: string, file: File, domainProfile?: string) => {
+  ingestDocument: (collection: string, embeddingModel: string, file: File, domainProfile?: string, contextHint?: string) => {
     const form = new FormData()
     form.append('collection', collection)
     form.append('embedding_model', embeddingModel)
     if (domainProfile) form.append('domain_profile', domainProfile)
+    if (contextHint) form.append('context_hint', contextHint)
     form.append('file', file)
     return req<{ collection: string; doc_id: string; chunks_indexed: number }>('/ingest', {
       method: 'POST',
@@ -257,17 +302,29 @@ export const api = {
     embeddingModel: string,
     file: File,
     domainProfile?: string,
+    contextHint?: string,
   ) => {
     const form = new FormData()
     form.append('collection', collection)
     form.append('embedding_model', embeddingModel)
     if (domainProfile) form.append('domain_profile', domainProfile)
+    if (contextHint) form.append('context_hint', contextHint)
     form.append('file', file)
     return req<IngestionJob>('/ingest/async', {
       method: 'POST',
       body: form,
     })
   },
+
+  updateCollectionContext: (collection: string, contextHint: string) =>
+    req<{ collection: string; context_hint: string; updated_documents: number }>(`/collections/${encodeURIComponent(collection)}/context`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context_hint: contextHint }),
+    }),
+
+  getCollectionSemanticProfile: (collection: string) =>
+    req<CollectionSemanticProfile>(`/collections/${encodeURIComponent(collection)}/semantic-profile`),
 
   listIngestionJobs: (limit = 50) =>
     req<IngestionJob[]>(`/ingest/jobs?limit=${encodeURIComponent(String(limit))}`),
@@ -306,6 +363,8 @@ export const api = {
   },
 
   listWorkspaces: () => req<Workspace[]>('/workspaces'),
+
+  getTabularEvaluation: () => req<TabularEvaluation>('/evaluation/tabular'),
 
   health: () => req<{ status: string }>('/health'),
 }
