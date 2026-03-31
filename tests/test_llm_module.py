@@ -73,13 +73,13 @@ def test_embedding_dimension_uses_override(monkeypatch):
 
 
 def test_chat_routes_to_groq(monkeypatch):
-    monkeypatch.setattr("src.llm.get_settings", lambda: type("S", (), {"llm_provider": "groq"})())
+    monkeypatch.setattr("src.llm.get_settings", lambda: type("S", (), {"llm_provider": "groq", "llm_model": "test"})())
     monkeypatch.setattr("src.llm._chat_groq", lambda messages, system, settings: "groq-ok")
     assert llm.chat([{"role": "user", "content": "oi"}]) == "groq-ok"
 
 
 def test_chat_routes_to_anthropic(monkeypatch):
-    monkeypatch.setattr("src.llm.get_settings", lambda: type("S", (), {"llm_provider": "anthropic"})())
+    monkeypatch.setattr("src.llm.get_settings", lambda: type("S", (), {"llm_provider": "anthropic", "llm_model": "test"})())
     monkeypatch.setattr("src.llm._chat_anthropic", lambda messages, system, settings: "anthropic-ok")
     assert llm.chat([{"role": "user", "content": "oi"}]) == "anthropic-ok"
 

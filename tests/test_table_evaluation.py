@@ -1,4 +1,4 @@
-from src.evaluation import evaluate_tabular_plans
+from src.evaluation import evaluate_tabular_benchmark, evaluate_tabular_plans
 
 
 def test_evaluate_tabular_plans_reports_summary():
@@ -22,6 +22,14 @@ def test_evaluate_tabular_plans_reports_summary():
             return {"intent": "tabular_distinct", "filters": []}
         if "colunas da tabela" in question:
             return {"intent": "tabular_schema", "filters": []}
+        if "cadastros por mes" in question:
+            return {
+                "intent": "tabular_groupby",
+                "metric_column": "id_cliente",
+                "filters": [],
+                "expected_unit": "count",
+                "time_grain": "month",
+            }
         return None
 
     report = evaluate_tabular_plans(planner)
@@ -29,3 +37,14 @@ def test_evaluate_tabular_plans_reports_summary():
     assert report["cases"] >= 4
     assert report["summary"]["tabular_plan_success_rate"] == 1.0
     assert report["summary"]["unit_render_accuracy"] == 1.0
+
+
+def test_evaluate_tabular_benchmark_exposes_catalog_suite():
+    report = evaluate_tabular_benchmark()
+
+    assert report["cases"] >= 14
+    assert "suites" in report
+    assert "catalog" in report["suites"]
+    assert "analytic" in report["suites"]
+    assert "time_series" in report["suites"]
+    assert "transactional" in report["suites"]

@@ -49,6 +49,18 @@ def test_extract_tables_from_text_accepts_csv_like_rows_with_short_ids():
     assert result.records[0].fields["id_cliente"] == "1"
 
 
+def test_extract_tables_from_text_accepts_identifierish_catalog_rows():
+    md = """
+| procedimento | descricao | cobertura |
+| --- | --- | --- |
+| A12 | Exame especial | Hospitalar |
+| B34 | Outro exame | Ambulatorial |
+"""
+    result = extract_tables_from_text(md)
+    assert len(result.records) == 2
+    assert result.records[0].fields["procedimento"] == "A12"
+
+
 def test_chunk_tabular_records_groups_short_rows():
     records = [
         TableRecord(i, 1, {"codigo": str(10000 + i)}, f"codigo: {10000 + i}", f"raw {i}")

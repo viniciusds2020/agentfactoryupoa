@@ -8,7 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from src.config import get_settings
-from src.table_semantics import normalize_semantic_text
+from src.table_semantics import infer_table_type, normalize_semantic_text
 from src.utils import get_logger, log_event
 
 logger = get_logger(__name__)
@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 class PlanFilter(BaseModel):
     column: str
-    operator: Literal["=", "!=", ">", "<", ">=", "<=", "in"] = "="
+    operator: Literal["=", "!=", ">", "<", ">=", "<=", "in", "between"] = "="
     value: str
 
 
@@ -30,6 +30,11 @@ class QueryPlan(BaseModel):
         "tabular_schema",
         "tabular_describe_column",
         "tabular_compare",
+        "catalog_lookup_by_id",
+        "catalog_lookup_by_title",
+        "catalog_field_lookup",
+        "catalog_record_summary",
+        "catalog_compare",
     ]
     subject: str = ""
     metric_column: str | None = None
@@ -40,16 +45,128 @@ class QueryPlan(BaseModel):
     group_by: list[str] = Field(default_factory=list)
     order_by: list[str] = Field(default_factory=list)
     limit: int = 1
+    time_grain: Literal["day", "month", "year"] | None = None
     expected_unit: str = ""
     confidence: float = 0.0
     assumptions: list[str] = Field(default_factory=list)
     planner_source: str = "heuristic"
+    table_mode: str = "analytic"
+
+
+def _catalog_identifier_profile(profiles: list[dict]):
+    return next((p for p in profiles if p.get("role") == "identifier"), None)
+
+
+def _catalog_title_profile(profiles: list[dict]):
+    return next((p for p in profiles if p.get("semantic_type") == "catalog_title"), None)
+
+
+def _catalog_field_profile(question: str, profiles: list[dict]):
+    q_norm = normalize_semantic_text(question).replace("_", " ")
+    preferred_semantic = {
+        "cobertura": "coverage_rule",
+        "autorizacao": "authorization_rule",
+        "autoriza": "authorization_rule",
+        "prazo": "deadline_rule",
+    }
+    for token, semantic_type in preferred_semantic.items():
+        if token in q_norm:
+            return next((p for p in profiles if p.get("semantic_type") == semantic_type), None)
+    for profile in profiles:
+        aliases = [alias for alias in profile.get("aliases", []) if alias]
+        if any(re.search(rf"\b{re.escape(alias)}\b", q_norm) for alias in aliases):
+            return profile
+    return None
+
+
+def _extract_catalog_title_value(question: str) -> str:
+    patterns = [
+        r"\bcodigo d[ao]s?\s+(.+?)\??$",
+        r"\bqual e o codigo d[ao]s?\s+(.+?)\??$",
+        r"\bqual o codigo d[ao]s?\s+(.+?)\??$",
+    ]
+    normalized = question.strip()
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" ?.")
+    return ""
+
+
+def _extract_catalog_ids(question: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"\b\d{4,}\b", question)))
+
+
+def _catalog_plan(question: str, profiles: list[dict], filters: list[dict], context_hint: str = "") -> QueryPlan | None:
+    identifier = _catalog_identifier_profile(profiles)
+    title = _catalog_title_profile(profiles)
+    field_profile = _catalog_field_profile(question, profiles)
+    ids = _extract_catalog_ids(question)
+    q_norm = normalize_semantic_text(question).replace("_", " ")
+
+    if re.search(r"\b(compare|comparar|comparacao|versus|vs\.?)\b", q_norm) and len(ids) >= 2 and identifier:
+        return QueryPlan(
+            intent="catalog_compare",
+            metric_column=identifier["name"],
+            filters=[PlanFilter(column=identifier["name"], operator="in", value="|".join(ids[:5]))],
+            confidence=0.93,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    if re.search(r"\b(resuma|resumo|explique|detalhe)\b", q_norm) and ids and identifier:
+        return QueryPlan(
+            intent="catalog_record_summary",
+            filters=[PlanFilter(column=identifier["name"], operator="=", value=ids[0])],
+            confidence=0.95,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    if ids and identifier and field_profile and field_profile["name"] != identifier["name"]:
+        return QueryPlan(
+            intent="catalog_field_lookup",
+            target_column=field_profile["name"],
+            filters=[PlanFilter(column=identifier["name"], operator="=", value=ids[0])],
+            confidence=0.97,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    if ids and identifier:
+        return QueryPlan(
+            intent="catalog_lookup_by_id",
+            filters=[PlanFilter(column=identifier["name"], operator="=", value=ids[0])],
+            confidence=0.97,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    title_value = _extract_catalog_title_value(question)
+    if title and title_value:
+        intent = "catalog_field_lookup" if field_profile and field_profile["name"] != title["name"] else "catalog_lookup_by_title"
+        return QueryPlan(
+            intent=intent,  # type: ignore[arg-type]
+            target_column=field_profile["name"] if intent == "catalog_field_lookup" and field_profile else None,
+            filters=[PlanFilter(column=title["name"], operator="=", value=title_value)],
+            confidence=0.9,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    return None
 
 
 def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], context_hint: str = "") -> QueryPlan | None:
     from src.structured_store import _resolve_inventory_column, _resolve_metric_column
 
     q_norm = normalize_semantic_text(question).replace("_", " ")
+    table_mode = infer_table_type(profiles, context_hint=context_hint)
+    if table_mode == "catalog":
+        catalog = _catalog_plan(question, profiles, filters, context_hint=context_hint)
+        if catalog:
+            return catalog
+
     metric = _resolve_metric_column(question, [_profile_obj(p) for p in profiles], context_hint=context_hint)
     inventory = _resolve_inventory_column(question, [_profile_obj(p) for p in profiles], context_hint=context_hint)
 
@@ -66,6 +183,7 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             confidence=0.9 if target else 0.5,
             assumptions=[] if target else ["coluna-alvo nao identificada com confianca alta"],
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     if re.search(r"\b(coluna|colunas|campos|field|fields|schema|estrutura da tabela)\b", q_norm):
@@ -73,6 +191,7 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             intent="tabular_schema",
             confidence=0.98,
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     if inventory and not re.search(r"\b(total|soma|somar|media|m[eé]dia|quantos|quantas|numero de|qtd|maximo|minimo|maior|menor|top)\b", q_norm):
@@ -83,6 +202,7 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             limit=100,
             confidence=0.95,
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     aggregation: str | None = None
@@ -104,11 +224,23 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
         intent = "tabular_aggregate"
 
     group_by: list[str] = []
+    time_grain: Literal["day", "month", "year"] | None = None
+    date_profile = next((p for p in profiles if p.get("semantic_type") in {"date", "datetime"}), None)
+    if re.search(r"\b(por mes|mensal|mes a mes)\b", q_norm):
+        time_grain = "month"
+    elif re.search(r"\b(por ano|anual)\b", q_norm):
+        time_grain = "year"
+    elif re.search(r"\b(por dia|diario|dia a dia)\b", q_norm):
+        time_grain = "day"
+    if time_grain and date_profile:
+        group_by.append(date_profile["name"])
+        intent = "tabular_groupby"
     if " por " in f" {q_norm} ":
         for profile in profiles:
             aliases = [alias for alias in profile.get("aliases", []) if alias]
             if any(re.search(rf"\bpor\s+{re.escape(alias)}\b", q_norm) for alias in aliases):
-                group_by.append(profile["name"])
+                if profile["name"] not in group_by:
+                    group_by.append(profile["name"])
                 break
         if group_by:
             intent = "tabular_groupby"
@@ -121,10 +253,12 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             aggregation=aggregation or "max",
             filters=[PlanFilter(**item) for item in filters],
             limit=int(rank_match.group(1)),
+            time_grain=time_grain,
             expected_unit=getattr(metric, "unit", ""),
             confidence=0.92,
             assumptions=[] if aggregation else ["ranking inferido a partir da metrica numerica principal"],
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     compare_match = re.search(r"\b(compare|comparar|comparacao|versus|vs\.?)\b", q_norm)
@@ -148,10 +282,12 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             filters=[PlanFilter(**item) for item in filters],
             group_by=[compare_dimension] if compare_dimension else [],
             limit=10,
+            time_grain=time_grain,
             expected_unit=getattr(metric, "unit", ""),
             confidence=0.78,
             assumptions=["comparacao inferida pela metrica principal"],
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     if intent:
@@ -162,10 +298,12 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             filters=[PlanFilter(**item) for item in filters],
             group_by=group_by,
             limit=10 if group_by else 1,
+            time_grain=time_grain,
             expected_unit=getattr(metric, "unit", "count" if aggregation == "count" else ""),
             confidence=0.9 if metric or aggregation == "count" else 0.6,
             assumptions=[],
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     if metric:
@@ -178,10 +316,12 @@ def _heuristic_plan(question: str, profiles: list[dict], filters: list[dict], co
             filters=[PlanFilter(**item) for item in filters],
             group_by=[],
             limit=1,
+            time_grain=time_grain,
             expected_unit=getattr(metric, "unit", ""),
             confidence=0.72,
             assumptions=assumptions,
             planner_source="heuristic",
+            table_mode=table_mode,
         )
 
     return None
@@ -192,10 +332,10 @@ def _profile_obj(profile: dict):
 
     return ColumnProfile(
         profile["name"],
-        profile["data_type"],
+        profile.get("data_type", profile.get("physical_type", "text")),
         profile["role"],
         profile["semantic_type"],
-        profile["unit"],
+        profile.get("unit", "text"),
         profile.get("aliases", []),
         profile.get("examples", []),
         profile.get("description", ""),

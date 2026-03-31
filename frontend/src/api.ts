@@ -1,4 +1,4 @@
-const BASE = '/api'
+const BASE = '/api/v1'
 
 const STORAGE_KEY = 'agent-factory-workspace-api-key'
 
@@ -98,6 +98,7 @@ export interface TableProfile {
   table_name: string
   base_context: string
   subject_label: string
+  table_type: string
   created_at: string
   updated_at: string
 }
@@ -118,10 +119,17 @@ export interface ColumnProfile {
   allowed_operations: string[]
 }
 
+export interface ValueCatalogItem {
+  normalized_value: string
+  raw_value: string
+  frequency: number
+}
+
 export interface CollectionSemanticProfile {
   collection: string
   profile: TableProfile | null
   columns: ColumnProfile[]
+  value_catalog: Record<string, ValueCatalogItem[]>
 }
 
 export interface TabularEvaluation {
@@ -130,6 +138,7 @@ export interface TabularEvaluation {
   details: Array<Record<string, unknown>>
   dataset?: string
   context_hint?: string
+  suites?: Record<string, Record<string, unknown>>
 }
 
 export interface Workspace {

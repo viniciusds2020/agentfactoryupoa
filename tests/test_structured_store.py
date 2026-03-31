@@ -55,6 +55,38 @@ def test_query_structured_by_filter(tmp_path, monkeypatch):
     assert rows[0]["codigo"] == "10101039"
 
 
+def test_query_structured_resolves_catalog_alias_to_physical_column(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "20017 | Visita Domiciliar",
+            "texto_canonico": "procedimento: 20017; descricao_unimed_poa: Visita Domiciliar",
+            "fields": {
+                "procedimento": "20017",
+                "descricao_unimed_poa": "Visita Domiciliar",
+                "cobertura_unimed_poa": "Hospitalar",
+            },
+        }
+    ]
+    structured_store.upsert_records(
+        "rol_catalogo",
+        "doc-1",
+        records,
+        ["procedimento", "descricao_unimed_poa", "cobertura_unimed_poa"],
+    )
+
+    rows = structured_store.query_structured("rol_catalogo", {"codigo": "20017"})
+
+    assert len(rows) == 1
+    assert rows[0]["procedimento"] == "20017"
+
+
 def test_delete_by_doc_id(tmp_path, monkeypatch):
     db_path = str(tmp_path / "structured.duckdb")
     monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
@@ -310,3 +342,140 @@ def test_plan_query_adds_comparative_age_filter_and_avoids_city_duplication(tmp_
     assert any(f["column"] == "idade" and f["operator"] == ">" and str(f["value"]) == "30" for f in plan["filters"])
     assert any(f["column"] == "estado" and f["value"] == "SP" for f in plan["filters"])
     assert not any(f["column"] == "cidade" and f["value"] == "Sao Paulo" for f in plan["filters"])
+
+
+def test_plan_query_catalog_lookup_by_id(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "20017 | Visita Domiciliar",
+            "texto_canonico": "procedimento: 20017; descricao_unimed_poa: Visita Domiciliar; cobertura_unimed_poa: Hospitalar",
+            "fields": {
+                "procedimento": "20017",
+                "descricao_unimed_poa": "Visita Domiciliar",
+                "cobertura_unimed_poa": "Hospitalar",
+                "orientacao_autorizacao_call_center": "Necessita autorizacao da Unidade",
+            },
+        }
+    ]
+    structured_store.upsert_records(
+        "rol",
+        "doc-1",
+        records,
+        ["procedimento", "descricao_unimed_poa", "cobertura_unimed_poa", "orientacao_autorizacao_call_center"],
+    )
+
+    plan = structured_store.plan_query("rol", "Qual e o procedimento com esse id 20017?", context_hint="Catalogo de procedimentos e cobertura")
+
+    assert plan is not None
+    assert plan["operation"] == "catalog_lookup"
+    assert plan["intent"] == "catalog_lookup_by_id"
+    assert plan["table_type"] == "catalog"
+    assert plan["filters"][0]["column"] == "procedimento"
+    assert plan["filters"][0]["value"] == "20017"
+
+
+def test_execute_plan_catalog_field_lookup(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "20017 | Visita Domiciliar",
+            "texto_canonico": "procedimento: 20017; descricao_unimed_poa: Visita Domiciliar; cobertura_unimed_poa: Hospitalar",
+            "fields": {
+                "procedimento": "20017",
+                "descricao_unimed_poa": "Visita Domiciliar",
+                "cobertura_unimed_poa": "Hospitalar",
+                "orientacao_autorizacao_call_center": "Necessita autorizacao da Unidade",
+            },
+        }
+    ]
+    structured_store.upsert_records(
+        "rol",
+        "doc-1",
+        records,
+        ["procedimento", "descricao_unimed_poa", "cobertura_unimed_poa", "orientacao_autorizacao_call_center"],
+    )
+
+    plan = structured_store.plan_query("rol", "Qual a cobertura do 20017?", context_hint="Catalogo de procedimentos")
+    result = structured_store.execute_plan("rol", plan)
+
+    assert result is not None
+    assert result["operation"] == "catalog_field_lookup"
+    assert result["record"]["procedimento"] == "20017"
+    assert result["target_column"] == "cobertura_unimed_poa"
+
+
+def test_plan_query_groupby_month_for_time_series(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "1 | 2025-01-10 | 1000",
+            "texto_canonico": "id_venda: 1; data_venda: 2025-01-10; valor_total: 1000",
+            "fields": {"id_venda": "1", "data_venda": "2025-01-10", "valor_total": "1000"},
+        },
+        {
+            "row_index": 1,
+            "page_number": 1,
+            "raw_row": "2 | 2025-02-10 | 1500",
+            "texto_canonico": "id_venda: 2; data_venda: 2025-02-10; valor_total: 1500",
+            "fields": {"id_venda": "2", "data_venda": "2025-02-10", "valor_total": "1500"},
+        },
+    ]
+    structured_store.upsert_records("vendas", "doc-1", records, ["id_venda", "data_venda", "valor_total"])
+
+    plan = structured_store.plan_query("vendas", "Qual a receita por mes?", context_hint="Base temporal de vendas")
+
+    assert plan is not None
+    assert plan["intent"] == "tabular_groupby"
+    assert plan["time_grain"] == "month"
+    assert plan["metric_column"] == "valor_total"
+
+
+def test_execute_plan_groupby_month_generates_bucketed_sql(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "1 | 2025-01-10 | 1000",
+            "texto_canonico": "id_venda: 1; data_venda: 2025-01-10; valor_total: 1000",
+            "fields": {"id_venda": "1", "data_venda": "2025-01-10", "valor_total": "1000"},
+        },
+        {
+            "row_index": 1,
+            "page_number": 1,
+            "raw_row": "2 | 2025-02-10 | 1500",
+            "texto_canonico": "id_venda: 2; data_venda: 2025-02-10; valor_total: 1500",
+            "fields": {"id_venda": "2", "data_venda": "2025-02-10", "valor_total": "1500"},
+        },
+    ]
+    structured_store.upsert_records("vendas", "doc-1", records, ["id_venda", "data_venda", "valor_total"])
+
+    plan = structured_store.plan_query("vendas", "Qual a receita por mes?", context_hint="Base temporal de vendas")
+    result = structured_store.execute_plan("vendas", plan)
+
+    assert result is not None
+    assert result["operation"] == "groupby"
+    assert "strftime(" in result["sql_generated"]

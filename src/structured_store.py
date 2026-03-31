@@ -11,7 +11,7 @@ from src.config import get_settings
 from src.observability import metrics
 from src.table_planner import build_query_plan
 from src.table_sql_builder import build_sql_for_plan
-from src.table_semantics import infer_semantic_column, semantic_role_for_type
+from src.table_semantics import infer_semantic_column, infer_table_type, semantic_role_for_type
 from src.table_validator import validate_query_plan
 from src.utils import get_logger, log_event
 
@@ -166,10 +166,14 @@ def query_structured(collection: str, filters: dict, limit: int = 20) -> list[di
     except Exception:
         return []
 
+    available_columns = set(_list_user_columns(collection))
+    profiles = _infer_column_profiles(collection)
     conditions = []
     params: list[object] = []
     for key, value in (filters or {}).items():
-        col = _normalize_identifier(key)
+        col = _resolve_filter_column(key, available_columns, profiles)
+        if not col:
+            continue
         conditions.append(f"LOWER(CAST({col} AS VARCHAR)) LIKE ?")
         params.append(f"%{str(value).strip().lower()}%")
 
@@ -181,6 +185,43 @@ def query_structured(collection: str, filters: dict, limit: int = 20) -> list[di
     rows = cursor.fetchall()
     columns = [d[0] for d in cursor.description]
     return [dict(zip(columns, row)) for row in rows]
+
+
+def _resolve_filter_column(key: str, available_columns: set[str], profiles: list[ColumnProfile]) -> str | None:
+    normalized = _normalize_identifier(key)
+    if normalized in available_columns:
+        return normalized
+
+    semantic_aliases: dict[str, str] = {
+        "codigo": "identifier",
+        "code": "identifier",
+        "id": "identifier",
+        "cobertura": "coverage_rule",
+        "autorizacao": "authorization_rule",
+        "prazo": "deadline_rule",
+        "descricao": "catalog_title",
+        "titulo": "catalog_title",
+    }
+    semantic_target = semantic_aliases.get(normalized)
+    if semantic_target:
+        match = next((profile.name for profile in profiles if profile.semantic_type == semantic_target and profile.name in available_columns), None)
+        if match:
+            return match
+
+    profile_match = next(
+        (
+            profile.name
+            for profile in profiles
+            if profile.name in available_columns and (
+                normalized in profile.aliases
+                or any(alias == normalized or normalized in alias or alias in normalized for alias in profile.aliases)
+            )
+        ),
+        None,
+    )
+    if profile_match:
+        return profile_match
+    return None
 
 
 def delete_by_doc_id(collection: str, doc_id: str) -> int:
@@ -324,16 +365,26 @@ def get_column_profiles(collection: str) -> list[dict]:
     ]
 
 
+def get_table_profile(collection: str, context_hint: str = "") -> dict:
+    profiles = get_column_profiles(collection)
+    return {
+        "table_name": _table_name(collection),
+        "table_type": infer_table_type(profiles, context_hint=context_hint),
+    }
+
+
 def _allowed_operations(semantic_type: str) -> list[str]:
     if semantic_type == "measure_currency":
         return ["sum", "avg", "min", "max"]
-    if semantic_type in {"measure_age_years", "measure_score", "measure_number"}:
+    if semantic_type in {"measure_age_years", "measure_score", "measure_number", "measure_percentage"}:
         return ["avg", "min", "max", "sum"]
-    if semantic_type.startswith("dimension_"):
+    if semantic_type in {"catalog_title", "catalog_attribute", "coverage_rule", "authorization_rule", "deadline_rule"}:
+        return ["lookup", "summary"]
+    if semantic_type.startswith("dimension_") or semantic_type == "flag_boolean":
         return ["filter", "distinct", "group_by"]
     if semantic_type == "identifier":
-        return ["filter", "distinct"]
-    if semantic_type == "date":
+        return ["filter", "distinct", "lookup"]
+    if semantic_type in {"date", "datetime"}:
         return ["filter", "group_by", "distinct"]
     return ["filter"]
 
@@ -391,10 +442,11 @@ def persist_table_semantics(collection: str, workspace_id: str = "default", cont
         if not context_hint:
             context_hint = controlplane.get_collection_context(workspace_id, collection)
         profiles = get_column_profiles(collection)
+        table_profile = get_table_profile(collection, context_hint=context_hint)
         controlplane.upsert_table_profile(
             workspace_id=workspace_id,
             collection=collection,
-            table_name=_table_name(collection),
+            table_name=table_profile["table_name"],
             base_context=context_hint,
             subject_label=infer_subject_label("", context_hint),
         )
@@ -572,9 +624,29 @@ def _resolve_comparative_filters(question: str, profiles: list[ColumnProfile]) -
             if matched:
                 break
 
+    date_profile = next((p for p in profiles if p.semantic_type in {"date", "datetime"}), None)
+    if date_profile:
+        between_match = re.search(r"\bentre\s+(\d{4})\s+e\s+(\d{4})\b", q_norm)
+        if between_match:
+            filters.append(
+                {
+                    "column": date_profile.name,
+                    "operator": "between",
+                    "value": f"{between_match.group(1)}-01-01|{between_match.group(2)}-12-31",
+                }
+            )
+        else:
+            after_match = re.search(r"\b(?:apos|a partir de|depois de)\s+(\d{4}(?:-\d{2}(?:-\d{2})?)?)\b", q_norm)
+            before_match = re.search(r"\b(?:antes de|ate|at[eé])\s+(\d{4}(?:-\d{2}(?:-\d{2})?)?)\b", q_norm)
+            if after_match:
+                filters.append({"column": date_profile.name, "operator": ">=", "value": after_match.group(1)})
+            if before_match:
+                filters.append({"column": date_profile.name, "operator": "<=", "value": before_match.group(1)})
+
     unique: dict[str, dict] = {}
     for flt in filters:
-        unique[flt["column"]] = flt
+        key = f"{flt['column']}::{flt.get('operator', '=')}"
+        unique[key] = flt
     return list(unique.values())
 
 
@@ -634,6 +706,11 @@ def plan_query(collection: str, question: str, context_hint: str = "") -> dict |
         "tabular_schema": "schema",
         "tabular_describe_column": "describe_column",
         "tabular_compare": "compare",
+        "catalog_lookup_by_id": "catalog_lookup",
+        "catalog_lookup_by_title": "catalog_lookup",
+        "catalog_field_lookup": "catalog_field_lookup",
+        "catalog_record_summary": "catalog_record_summary",
+        "catalog_compare": "catalog_compare",
     }
     normalized = dict(validation.normalized_plan)
     normalized["operation"] = operation_by_intent.get(normalized.get("intent", ""), "")
@@ -647,6 +724,7 @@ def plan_query(collection: str, question: str, context_hint: str = "") -> dict |
             flt for flt in normalized.get("filters", []) or []
             if flt.get("column") not in group_by
         ]
+    normalized["table_type"] = infer_table_type(profile_dicts, context_hint=context_hint)
 
     if validation.valid:
         metrics.increment("tabular_plan_success_rate")
@@ -702,6 +780,24 @@ def execute_plan(collection: str, plan: dict) -> dict | None:
             "sql_generated": "",
         }
 
+    if op in {"catalog_lookup", "catalog_field_lookup", "catalog_record_summary", "catalog_compare"}:
+        profiles = get_column_profiles(collection)
+        rows = _execute_catalog_plan(collection, plan, profiles)
+        if not rows:
+            return None
+        if op == "catalog_compare":
+            return {"operation": op, "rows": rows, "profiles": profiles, "plan": plan, "sql_generated": ""}
+        record = rows[0]
+        return {
+            "operation": op,
+            "record": record,
+            "rows": rows,
+            "profiles": profiles,
+            "target_column": plan.get("target_column"),
+            "plan": plan,
+            "sql_generated": "",
+        }
+
     sql, params = build_sql_for_plan(table, plan, backend=_BACKEND or "duckdb")
     if not sql:
         return None
@@ -732,3 +828,59 @@ def execute_plan(collection: str, plan: dict) -> dict | None:
         return {"operation": op, "rows": [dict(zip(columns_out, row)) for row in rows], "plan": plan, "sql_generated": sql}
 
     return None
+
+
+def _all_rows(collection: str, limit: int | None = None) -> list[dict]:
+    table = _table_name(collection)
+    try:
+        conn = get_connection()
+        sql = f"SELECT * FROM {table}"
+        params: list[object] = []
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        cursor = conn.execute(sql, params)
+        rows = cursor.fetchall()
+        columns = [d[0] for d in cursor.description]
+    except Exception:
+        return []
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _matches_filter(row: dict, flt: dict) -> bool:
+    column = str(flt.get("column") or "")
+    operator = str(flt.get("operator") or "=").strip()
+    value = str(flt.get("value") or "")
+    raw = row.get(column)
+    text = _normalize_text(str(raw or ""))
+    target = _normalize_text(value)
+    if operator == "=":
+        return text == target
+    if operator == "in":
+        values = {_normalize_text(item) for item in value.split("|") if item.strip()}
+        return text in values
+    return False
+
+
+def _execute_catalog_plan(collection: str, plan: dict, profiles: list[dict]) -> list[dict]:
+    rows = _all_rows(collection)
+    if not rows:
+        return []
+    matched = rows
+    for flt in plan.get("filters", []) or []:
+        matched = [row for row in matched if _matches_filter(row, flt)]
+
+    if matched:
+        return matched[:10]
+
+    # fallback for title lookup with normalized contains
+    title_col = next((p["name"] for p in profiles if p.get("semantic_type") == "catalog_title"), "")
+    if title_col:
+        for flt in plan.get("filters", []) or []:
+            if flt.get("column") != title_col:
+                continue
+            target = _normalize_text(str(flt.get("value") or ""))
+            fuzzy = [row for row in rows if target and target in _normalize_text(str(row.get(title_col) or ""))]
+            if fuzzy:
+                return fuzzy[:10]
+    return []

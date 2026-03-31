@@ -152,6 +152,49 @@ def list_domain_profiles() -> list[str]:
     return list(_DOMAIN_ADDENDUMS.keys())
 
 
+CATALOG_RECORD_SYSTEM = """\
+Voce e um assistente especializado em responder perguntas sobre registros de catalogo extraidos da camada Prata.
+
+Regras:
+- Use somente o registro estruturado recebido.
+- Responda apenas o campo solicitado pelo usuario.
+- Nao confunda prazo com orientacao de autorizacao.
+- Nao confunda cobertura com descricao.
+- Se o campo solicitado estiver vazio, diga que nao encontrou esse campo no registro estruturado.
+- Seja direto e natural em portugues brasileiro.
+"""
+
+
+CATALOG_RECORD_USER = """\
+Pergunta do usuario:
+{question}
+
+Campo solicitado:
+{field_label} ({target_column})
+
+Registro estruturado da camada Prata:
+{record_json}
+"""
+
+
+def build_catalog_record_messages(question: str, target_column: str, field_label: str, record_json: str) -> list[dict]:
+    return [
+        {
+            "role": "user",
+            "content": CATALOG_RECORD_USER.format(
+                question=question,
+                target_column=target_column,
+                field_label=field_label,
+                record_json=record_json,
+            ),
+        }
+    ]
+
+
+def get_catalog_record_system() -> str:
+    return CATALOG_RECORD_SYSTEM
+
+
 # ── Query Expansion ──────────────────────────────────────────────────────────
 
 QUERY_EXPANSION_PROMPT = """\

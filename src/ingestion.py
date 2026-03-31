@@ -1156,6 +1156,9 @@ def ingest(
             log_event(logger, 30, "Legal tree/summary generation failed (non-fatal)",
                       doc_id=doc_id, error=str(exc))
 
+    from src.observability import INGESTION_TOTAL
+    INGESTION_TOTAL.labels(status="indexed").inc()
+
     if stage_callback:
         stage_callback("indexed", {"doc_id": doc_id, "chunks": len(chunks)})
     return len(chunks)

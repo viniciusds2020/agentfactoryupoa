@@ -8,6 +8,8 @@ from dataclasses import dataclass
 _INTERNAL_FOOTER_RE = re.compile(r"classifica[cç][aã]o da informa[cç][aã]o:\s*interno", re.IGNORECASE)
 _CODE_RE = re.compile(r"^\d{5,}$")
 _DIGIT_SIGNAL_RE = re.compile(r"\d")
+_SHORT_IDENTIFIER_RE = re.compile(r"^(?:[A-Z]{1,4}[-_/]?)?\d{2,}$", re.IGNORECASE)
+_ALPHANUMERIC_IDENTIFIER_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_/]{2,}$", re.IGNORECASE)
 
 
 def _normalize_cell(value: object) -> str:
@@ -30,14 +32,31 @@ def _row_has_valid_code(row: list[str]) -> bool:
     return False
 
 
+def _cell_looks_identifierish(cell: str) -> bool:
+    text = cell.strip()
+    if not text:
+        return False
+    if _CODE_RE.match(text) or _SHORT_IDENTIFIER_RE.match(text):
+        return True
+    if _ALPHANUMERIC_IDENTIFIER_RE.match(text):
+        letters = sum(1 for ch in text if ch.isalpha())
+        digits = sum(1 for ch in text if ch.isdigit())
+        return digits >= 2 or (letters >= 1 and digits >= 1)
+    return False
+
+
 def _row_looks_tabular(row: list[str], expected_columns: int) -> bool:
     non_empty = [cell.strip() for cell in row if cell.strip()]
     if len(non_empty) < max(2, min(expected_columns, 3)):
         return False
     if _row_has_valid_code(row):
         return True
+    if non_empty and _cell_looks_identifierish(non_empty[0]):
+        return True
     digit_cells = sum(1 for cell in non_empty if _DIGIT_SIGNAL_RE.search(cell))
-    return digit_cells >= 2
+    if digit_cells >= 2:
+        return True
+    return len(non_empty) >= max(3, min(expected_columns, 4))
 
 
 @dataclass

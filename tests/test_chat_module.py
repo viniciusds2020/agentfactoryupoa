@@ -929,6 +929,626 @@ def test_answer_table_first_compare_is_executive(monkeypatch, tmp_path):
     assert result.sources[0].metadata["plan"]["operation"] == "compare"
 
 
+def test_answer_table_first_catalog_lookup_by_id(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {
+            "procedimento": "20017",
+            "descricao_unimed_poa": "Visita Domiciliar",
+            "cobertura_unimed_poa": "Hospitalar",
+            "orientacao_autorizacao_call_center": "Necessita autorizacao da Unidade",
+        }),
+    ]
+    structured_store.upsert_records(
+        "rol",
+        "doc.csv",
+        records,
+        ["procedimento", "descricao_unimed_poa", "cobertura_unimed_poa", "orientacao_autorizacao_call_center"],
+    )
+
+    monkeypatch.setattr(
+        "src.chat._get_collection_context_hint",
+        lambda workspace_id, collection: "Catalogo de procedimentos com cobertura e autorizacao.",
+    )
+
+    result = chat.answer(collection="rol", question="Qual e o procedimento com esse id 20017?", request_id="req-catalog-id")
+
+    assert "codigo 20017" in result.answer.lower()
+    assert "visita domiciliar" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "catalog_lookup"
+    assert result.sources[0].metadata["citation_label"] == "registro de catalogo"
+
+
+def test_answer_table_first_catalog_field_lookup(monkeypatch, tmp_path):
+    from src import structured_store
+
+    db_path = tmp_path / "structured.duckdb"
+    settings = _settings(structured_store_path=str(db_path), query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store._CONN", None)
+    monkeypatch.setattr("src.structured_store._BACKEND", "")
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    class Rec:
+        def __init__(self, row_index, fields):
+            self.row_index = row_index
+            self.page_number = None
+            self.fields = fields
+            self.raw_row = ""
+            self.texto_canonico = "; ".join(f"{k}: {v}" for k, v in fields.items())
+
+    records = [
+        Rec(0, {
+            "procedimento": "20017",
+            "descricao_unimed_poa": "Visita Domiciliar",
+            "cobertura_unimed_poa": "Hospitalar",
+            "orientacao_autorizacao_call_center": "Necessita autorizacao da Unidade",
+        }),
+    ]
+    structured_store.upsert_records(
+        "rol",
+        "doc.csv",
+        records,
+        ["procedimento", "descricao_unimed_poa", "cobertura_unimed_poa", "orientacao_autorizacao_call_center"],
+    )
+
+    monkeypatch.setattr(
+        "src.chat._get_collection_context_hint",
+        lambda workspace_id, collection: "Catalogo de procedimentos com cobertura e autorizacao.",
+    )
+
+    result = chat.answer(collection="rol", question="Qual a cobertura do 20017?", request_id="req-catalog-field")
+
+    assert "hospitalar" in result.answer.lower()
+    assert "procedimento 20017" in result.answer.lower()
+    assert result.sources[0].metadata["plan"]["operation"] == "catalog_field_lookup"
+
+
+def test_answer_catalog_code_from_artifact_when_no_structured_store(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "rol.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "20101325 Consulta em pronto atendimento", "page_number": 1},
+                    {"text": "Cobertura Hospitalar", "page_number": 1},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.chat._resolve_processed_json",
+        lambda doc_id, filename: artifact_path,
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "rol", "filename": "rol.pdf"})()],
+    )
+
+    result = chat.answer(collection="rol", question="Qual e o procedimento 20101325?", request_id="req-artifact-catalog")
+
+    assert "20101325" in result.answer
+    assert "pronto atendimento" in result.answer.lower()
+    assert result.sources[0].metadata["source_kind"] == "artifact_lookup"
+
+
+def test_answer_catalog_field_from_artifact_uses_catalog_schema(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "rol.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento\nDescrição Unimed POA\nCobertura\nPrazo Autorização\nOrientação Autorização"},
+                    {"text": "10102914"},
+                    {"text": "Atendimento / Acompanhamento em Hospital-dia Psiquiátrico"},
+                    {"text": "Somente Regulamentados\nHospitalar\nNÃO\nHospital-dia - até 5 (cinco) dias úteis"},
+                    {"text": "Necessita autorização Auditoria Médica e Unidade"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.chat._resolve_processed_json",
+        lambda doc_id, filename: artifact_path,
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "rol", "filename": "rol.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {
+                "column_name": "procedimento",
+                "semantic_type": "identifier",
+                "aliases": ["procedimento", "codigo", "id"],
+            },
+            {
+                "column_name": "prazo_autorizacao_conforme_rn_n_623_ans",
+                "semantic_type": "deadline_rule",
+                "aliases": ["prazo", "prazo autorizacao"],
+            },
+        ],
+    )
+
+    result = chat.answer(
+        collection="rol",
+        question="Qual o Prazo Autorizacao do procedimento 10102914?",
+        request_id="req-artifact-field",
+    )
+
+    assert "prazo de autorizacao" in result.answer.lower()
+    assert "5 (cinco) dias úteis" in result.answer.lower()
+    assert result.sources[0].metadata["target_column"] == "prazo_autorizacao_conforme_rn_n_623_ans"
+
+
+def test_answer_generic_catalog_field_from_artifact_uses_semantic_profiles(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "catalogo.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Codigo do Item Nome do Item Categoria Prazo de Entrega Regra de Liberacao"},
+                    {"text": "50123"},
+                    {"text": "Kit Especial de Internacao"},
+                    {"text": "Hospitalar\nAte 72 horas\nLiberacao da central tecnica"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "catalogo", "filename": "catalogo.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "codigo_item", "semantic_type": "identifier", "role": "identifier", "aliases": ["codigo", "item"]},
+            {"column_name": "nome_item", "semantic_type": "catalog_title", "role": "text", "aliases": ["nome do item", "nome item"]},
+            {"column_name": "categoria_item", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["categoria"]},
+            {"column_name": "prazo_entrega", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo de entrega", "prazo"]},
+            {"column_name": "regra_liberacao", "semantic_type": "authorization_rule", "role": "text", "aliases": ["regra de liberacao", "liberacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="catalogo",
+        question="Qual o prazo do item 50123?",
+        request_id="req-generic-catalog-artifact",
+    )
+
+    assert "50123" in result.answer
+    assert "72 horas" in result.answer.lower()
+    assert result.sources[0].metadata["target_column"] == "prazo_entrega"
+
+
+def test_answer_catalog_field_request_prioritizes_deadline_over_authorization(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "rol.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento Descricao Prazo Autorizacao", "page_number": 1},
+                    {"text": "10102914", "page_number": 1},
+                    {"text": "Atendimento / Acompanhamento em Hospital-dia Psiquiatrico", "page_number": 1},
+                    {"text": "Hospitalar\nAte 5 (cinco) dias uteis", "page_number": 1},
+                    {"text": "Necessita autorizacao Auditoria Medica e Unidade", "page_number": 1},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "rol", "filename": "rol.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao"]},
+            {"column_name": "prazo_autorizacao", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo autorizacao", "prazo"]},
+            {"column_name": "orientacao_autorizacao", "semantic_type": "authorization_rule", "role": "text", "aliases": ["autorizacao", "orientacao autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="rol",
+        question="Qual o Prazo Autorizacao do procedimento 10102914?",
+        request_id="req-catalog-deadline-priority",
+    )
+
+    assert "prazo de autorizacao" in result.answer.lower()
+    assert "5 (cinco) dias uteis" in result.answer.lower()
+    assert "necessita autorizacao" not in result.answer.lower()
+    assert result.sources[0].metadata["target_column"] == "prazo_autorizacao"
+
+
+def test_answer_catalog_deadline_from_realistic_split_blocks(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    blocks = [{"text": f"bloco {i}", "page_number": 3} for i in range(58)]
+    blocks.extend(
+        [
+            {
+                "text": "Procedimento Descricao Unimed POA Segmentacao ANS Cobertura Unimed POA Emergencia Prazo Autorizacao conforme RN 623 ANS Orientacao Autorizacao Call Center",
+                "page_number": 3,
+            },
+            {"text": "10102914", "page_number": 3},
+            {
+                "text": "Atendimento / Acompanhamento em Hospital-dia Psiquiatrico (com diretriz definida pela ANS - n 109)",
+                "page_number": 3,
+            },
+            {
+                "text": "Somente\nRegulamentados\nHospitalar\nNAO\nHospital-dia - ate 5 (cinco) dias uteis",
+                "page_number": 3,
+            },
+            {
+                "text": "Necessita autorizacao Auditoria Medica e Unidade",
+                "page_number": 3,
+            },
+            {"text": "10103015", "page_number": 3},
+        ]
+    )
+    artifact_path = tmp_path / "rol_realistic.json"
+    artifact_path.write_text(json.dumps({"blocks": blocks}, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "rol", "filename": "rol.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao_unimed_poa", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao unimed poa", "descricao"]},
+            {"column_name": "segmentacao_ans", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["segmentacao ans"]},
+            {"column_name": "cobertura_unimed_poa", "semantic_type": "coverage_rule", "role": "text", "aliases": ["cobertura unimed poa", "cobertura"]},
+            {"column_name": "emergencia", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["emergencia"]},
+            {"column_name": "prazo_autorizacao_conforme_rn_n_623_ans", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo autorizacao", "prazo"]},
+            {"column_name": "orientacao_autorizacao_call_center", "semantic_type": "authorization_rule", "role": "text", "aliases": ["orientacao autorizacao", "autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="rol",
+        question="Qual o Prazo Autorizacao do procedimento 10102914?",
+        request_id="req-catalog-realistic-deadline",
+    )
+
+    normalized_answer = chat._normalize_for_match(result.answer)
+    assert "prazo de autorizacao" in normalized_answer
+    assert "hospital-dia - ate 5 (cinco) dias uteis" in normalized_answer
+    assert "auditoria medica e unidade" not in result.answer.lower()
+    assert result.sources[0].metadata["target_column"] == "prazo_autorizacao_conforme_rn_n_623_ans"
+
+
+def test_answer_catalog_field_from_artifact_uses_silver_json_prompt(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "rol_prompt.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento Descricao Prazo Autorizacao", "page_number": 1},
+                    {"text": "10102914", "page_number": 1},
+                    {"text": "Atendimento em Hospital-dia Psiquiatrico", "page_number": 1},
+                    {"text": "Hospitalar\nAte 5 (cinco) dias uteis", "page_number": 1},
+                    {"text": "Necessita autorizacao Auditoria Medica e Unidade", "page_number": 1},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    captured = {}
+
+    def fake_chat(messages, system=""):
+        captured["system"] = system
+        captured["messages"] = messages
+        return "O prazo de autorizacao do procedimento 10102914 e: Ate 5 (cinco) dias uteis."
+
+    monkeypatch.setattr("src.chat.llm.chat", fake_chat)
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "rol", "filename": "rol.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao"]},
+            {"column_name": "prazo_autorizacao", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo autorizacao", "prazo"]},
+            {"column_name": "orientacao_autorizacao", "semantic_type": "authorization_rule", "role": "text", "aliases": ["autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="rol",
+        question="Qual o Prazo Autorizacao do procedimento 10102914?",
+        request_id="req-silver-json-prompt",
+    )
+
+    joined = "\n".join(msg["content"] for msg in captured["messages"])
+    assert "prazo_autorizacao" in joined
+    assert "\"10102914\"" in joined
+    assert "\"orientacao_autorizacao\"" in joined
+    assert "registro estruturado da camada prata" in joined.lower()
+    assert "ate 5 (cinco) dias uteis" in chat._normalize_for_match(result.answer)
+
+
+def test_catalog_artifact_parser_keeps_rows_independent_by_code_boundary(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "catalog_boundary.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento Descricao Prazo Autorizacao", "page_number": 1},
+                    {"text": "10001", "page_number": 1},
+                    {"text": "Primeiro item", "page_number": 1},
+                    {"text": "Ate 2 dias uteis", "page_number": 1},
+                    {"text": "Nao necessita autorizacao", "page_number": 1},
+                    {"text": "10002", "page_number": 1},
+                    {"text": "Segundo item", "page_number": 1},
+                    {"text": "Ate 7 dias uteis", "page_number": 1},
+                    {"text": "Necessita autorizacao da unidade", "page_number": 1},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "catalogo", "filename": "catalogo.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao"]},
+            {"column_name": "prazo", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo"]},
+            {"column_name": "autorizacao", "semantic_type": "authorization_rule", "role": "text", "aliases": ["autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="catalogo",
+        question="Qual o prazo do procedimento 10002?",
+        request_id="req-catalog-boundary",
+    )
+
+    assert "10002" in result.answer
+    assert "7 dias uteis" in result.answer.lower()
+    assert "2 dias uteis" not in result.answer.lower()
+
+
+def test_catalog_artifact_parser_handles_header_split_across_blocks(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "catalog_split_header.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento Descricao Unimed POA Cobertura Unimed POA", "page_number": 1},
+                    {"text": "Segmentacao ANS Emergencia Prazo Autorizacao conforme RN 623 ANS", "page_number": 1},
+                    {"text": "Orientacao Autorizacao Call Center", "page_number": 1},
+                    {"text": "10102914", "page_number": 1},
+                    {"text": "Atendimento em Hospital-dia Psiquiatrico", "page_number": 1},
+                    {"text": "Somente Regulamentados\nHospitalar\nNAO\nAte 5 (cinco) dias uteis", "page_number": 1},
+                    {"text": "Necessita autorizacao Auditoria Medica e Unidade", "page_number": 1},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "catalogo", "filename": "catalogo.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao_unimed_poa", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao unimed poa", "descricao"]},
+            {"column_name": "segmentacao_ans", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["segmentacao ans"]},
+            {"column_name": "cobertura_unimed_poa", "semantic_type": "coverage_rule", "role": "text", "aliases": ["cobertura unimed poa", "cobertura"]},
+            {"column_name": "emergencia", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["emergencia"]},
+            {"column_name": "prazo_autorizacao_conforme_rn_n_623_ans", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo autorizacao", "prazo"]},
+            {"column_name": "orientacao_autorizacao_call_center", "semantic_type": "authorization_rule", "role": "text", "aliases": ["orientacao autorizacao", "autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="catalogo",
+        question="Qual o prazo do procedimento 10102914?",
+        request_id="req-catalog-split-header",
+    )
+
+    assert "5 (cinco) dias uteis" in result.answer.lower()
+    assert result.sources[0].metadata["target_column"] == "prazo_autorizacao_conforme_rn_n_623_ans"
+
+
+def test_catalog_artifact_parser_skips_repeated_header_on_next_page(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    repeated_header = "Procedimento Descricao Unimed POA Segmentacao ANS Cobertura Unimed POA Emergencia Prazo Autorizacao Orientacao Autorizacao"
+    artifact_path = tmp_path / "catalog_repeated_header.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": repeated_header, "page_number": 1},
+                    {"text": "10102914", "page_number": 1},
+                    {"text": "Atendimento em Hospital-dia Psiquiatrico", "page_number": 1},
+                    {"text": repeated_header, "page_number": 2},
+                    {"text": "Somente Regulamentados\nHospitalar\nNAO\nAte 5 (cinco) dias uteis", "page_number": 2},
+                    {"text": "Necessita autorizacao Auditoria Medica e Unidade", "page_number": 2},
+                    {"text": "10103015", "page_number": 2},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "catalogo", "filename": "catalogo.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao_unimed_poa", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao unimed poa", "descricao"]},
+            {"column_name": "segmentacao_ans", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["segmentacao ans"]},
+            {"column_name": "cobertura_unimed_poa", "semantic_type": "coverage_rule", "role": "text", "aliases": ["cobertura unimed poa", "cobertura"]},
+            {"column_name": "emergencia", "semantic_type": "catalog_attribute", "role": "text", "aliases": ["emergencia"]},
+            {"column_name": "prazo_autorizacao_conforme_rn_n_623_ans", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo autorizacao", "prazo"]},
+            {"column_name": "orientacao_autorizacao_call_center", "semantic_type": "authorization_rule", "role": "text", "aliases": ["orientacao autorizacao", "autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="catalogo",
+        question="Qual o prazo do procedimento 10102914?",
+        request_id="req-catalog-repeated-header",
+    )
+
+    assert "5 (cinco) dias uteis" in result.answer.lower()
+    assert "procedimento descricao" not in result.answer.lower()
+
+
+def test_catalog_artifact_parser_handles_record_crossing_pages(monkeypatch, tmp_path):
+    settings = _settings(query_routing_enabled=True, structured_store_enabled=True)
+    monkeypatch.setattr("src.chat.get_settings", lambda: settings)
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda c: False)
+    monkeypatch.setattr("src.chat.llm.embed", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("vector path should not be used")))
+
+    artifact_path = tmp_path / "catalog_cross_page.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"text": "Procedimento Descricao Prazo Autorizacao", "page_number": 1},
+                    {"text": "10102914", "page_number": 1},
+                    {"text": "Atendimento em Hospital-dia Psiquiatrico", "page_number": 1},
+                    {"text": "Procedimento Descricao Prazo Autorizacao", "page_number": 2},
+                    {"text": "Hospitalar\nAte 5 (cinco) dias uteis", "page_number": 2},
+                    {"text": "Necessita autorizacao Auditoria Medica e Unidade", "page_number": 2},
+                    {"text": "10103015", "page_number": 2},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("src.chat._resolve_processed_json", lambda doc_id, filename: artifact_path)
+    monkeypatch.setattr(
+        "src.controlplane.list_documents",
+        lambda workspace_id, collection: [type("Doc", (), {"doc_id": "catalogo", "filename": "catalogo.pdf"})()],
+    )
+    monkeypatch.setattr(
+        "src.controlplane.list_column_profiles",
+        lambda workspace_id, collection: [
+            {"column_name": "procedimento", "semantic_type": "identifier", "role": "identifier", "aliases": ["procedimento", "codigo", "id"]},
+            {"column_name": "descricao", "semantic_type": "catalog_title", "role": "text", "aliases": ["descricao"]},
+            {"column_name": "cobertura", "semantic_type": "coverage_rule", "role": "text", "aliases": ["cobertura"]},
+            {"column_name": "prazo", "semantic_type": "deadline_rule", "role": "text", "aliases": ["prazo"]},
+            {"column_name": "autorizacao", "semantic_type": "authorization_rule", "role": "text", "aliases": ["autorizacao"]},
+        ],
+    )
+
+    result = chat.answer(
+        collection="catalogo",
+        question="Qual o prazo do procedimento 10102914?",
+        request_id="req-catalog-cross-page",
+    )
+
+    assert "5 (cinco) dias uteis" in result.answer.lower()
+    assert "10103015" not in result.answer
+
+
 def test_answer_returns_direct_message_when_no_results(monkeypatch):
     monkeypatch.setattr("src.chat.get_settings", lambda: _settings())
     monkeypatch.setattr("src.chat.vectordb.resolve_query_collection", lambda c, m, workspace_id="default": f"{workspace_id}::{c}::{m}")

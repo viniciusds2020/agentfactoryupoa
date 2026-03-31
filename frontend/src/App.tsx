@@ -22,6 +22,11 @@ const MODE_STORAGE_KEY = 'kb-mode-locks-v1'
 
 type ViewTab = 'chat' | 'ingestion'
 type BaseMode = 'general' | 'legal' | 'tabular'
+type SuggestedMode = {
+  mode: BaseMode
+  subtype?: 'catalog' | 'analytic'
+  reason: string
+} | null
 
 type BaseModeState = {
   mode: BaseMode
@@ -92,6 +97,26 @@ function stageProgress(status: string) {
   return 0
 }
 
+function inferSuggestedModeFromFile(file: File): SuggestedMode {
+  const name = file.name.toLowerCase()
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : ''
+  if (['.csv', '.xlsx', '.xls'].includes(ext)) {
+    const isCatalog = /(rol|procedimento|procedimentos|codigo|codigos|cobertura|autorizacao|tabela)/.test(name)
+    return {
+      mode: 'tabular',
+      subtype: isCatalog ? 'catalog' : 'analytic',
+      reason: isCatalog ? 'arquivo tabular com cara de catalogo/codigos' : 'arquivo tabular estruturado',
+    }
+  }
+  if (/(estatuto|contrato|regulamento|aditivo|juridic|clausula)/.test(name)) {
+    return { mode: 'legal', reason: 'nome do arquivo sugere conteudo juridico/contratual' }
+  }
+  if (/(procedimento|procedimentos|rol|codigo|cobertura|autorizacao|tabela)/.test(name)) {
+    return { mode: 'tabular', subtype: 'catalog', reason: 'arquivo sugere catalogo de codigos ou tabela operacional' }
+  }
+  return { mode: 'general', reason: 'documento narrativo/corporativo por padrao' }
+}
+
 export default function App() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -128,6 +153,7 @@ export default function App() {
   const [semanticLoading, setSemanticLoading] = useState(false)
   const [semanticError, setSemanticError] = useState<string | null>(null)
   const [tabularEval, setTabularEval] = useState<TabularEvaluation | null>(null)
+  const [suggestedMode, setSuggestedMode] = useState<SuggestedMode>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -348,6 +374,7 @@ export default function App() {
 
   const clearSelectedFile = () => {
     setFile(null)
+    setSuggestedMode(null)
     setUploadMsg(null)
     setUploadError(null)
     if (fileRef.current) fileRef.current.value = ''
@@ -408,6 +435,7 @@ export default function App() {
       }
 
       setFile(null)
+      setSuggestedMode(null)
       if (fileRef.current) fileRef.current.value = ''
       await refreshCollections()
       await refreshIngestionData()
@@ -691,7 +719,20 @@ export default function App() {
             accept=".pdf,.docx,.pptx,.txt,.md,.xlsx,.xls,.csv"
             className="hidden"
             onChange={(e) => {
-              setFile(e.target.files?.[0] ?? null)
+              const selected = e.target.files?.[0] ?? null
+              setFile(selected)
+              if (selected && !isModeLocked && documents.length === 0) {
+                const suggestion = inferSuggestedModeFromFile(selected)
+                setSuggestedMode(suggestion)
+                if (suggestion) {
+                  setBaseMode(suggestion.mode)
+                  if (collection) {
+                    setModeStateForCollection(collection, { mode: suggestion.mode, locked: false })
+                  }
+                }
+              } else if (!selected) {
+                setSuggestedMode(null)
+              }
               setUploadMsg(null)
               setUploadError(null)
             }}
@@ -833,6 +874,13 @@ export default function App() {
                             {isModeLocked && (
                               <div className="ops-item-meta" style={{ marginTop: 8 }}>
                                 Modo fixo desta base. Para outro modo, crie uma nova base.
+                              </div>
+                            )}
+                            {!isModeLocked && suggestedMode && documents.length === 0 && (
+                              <div className="ops-item-meta" style={{ marginTop: 8 }}>
+                                Sugestao automatica: <strong>{MODE_LABELS[suggestedMode.mode]}</strong>
+                                {suggestedMode.subtype === 'catalog' ? ' • subtipo Catalogo/Codigos' : suggestedMode.subtype === 'analytic' ? ' • subtipo Analitico' : ''}
+                                {' '}({suggestedMode.reason}).
                               </div>
                             )}
                           </div>
@@ -1009,6 +1057,19 @@ export default function App() {
                               sujeito: {semanticProfile.profile?.subject_label || 'registros'}
                             </div>
                             <div className="ops-item-meta">
+                              tipo detectado: {(
+                                semanticProfile.profile?.table_type === 'catalog'
+                                  ? 'Catalogo/Codigos'
+                                  : semanticProfile.profile?.table_type === 'time_series'
+                                    ? 'Serie temporal'
+                                    : semanticProfile.profile?.table_type === 'transactional'
+                                      ? 'Transacional'
+                                      : semanticProfile.profile?.table_type === 'mixed'
+                                        ? 'Misto'
+                                        : 'Planilhas/Tabelas analiticas'
+                              )}
+                            </div>
+                            <div className="ops-item-meta">
                               {semanticProfile.profile?.base_context || tableContext || 'Sem contexto salvo.'}
                             </div>
                           </div>
@@ -1025,6 +1086,11 @@ export default function App() {
                               <div className="ops-item-meta">
                                 dataset: {tabularEval.dataset || 'tabular_gold'} • casos: {tabularEval.cases}
                               </div>
+                              {tabularEval.suites && (
+                                <div className="ops-item-meta">
+                                  suites: {Object.keys(tabularEval.suites).join(', ')}
+                                </div>
+                              )}
                             </div>
                           </div>
                         )}
@@ -1044,6 +1110,11 @@ export default function App() {
                               <div className="ops-item-meta">
                                 operacoes: {col.allowed_operations.join(', ') || '-'}
                               </div>
+                              {!!semanticProfile.value_catalog?.[col.column_name]?.length && (
+                                <div className="ops-item-meta">
+                                  exemplos reais: {semanticProfile.value_catalog[col.column_name].slice(0, 4).map((item) => item.raw_value).join(', ')}
+                                </div>
+                              )}
                             </div>
                           </div>
                         ))}

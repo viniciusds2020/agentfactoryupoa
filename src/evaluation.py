@@ -514,6 +514,12 @@ TABULAR_GOLD_CASES = [
         "question": "Quais sao as colunas da tabela?",
         "expected_intent": "tabular_schema",
     },
+    {
+        "question": "Quantos cadastros por mes?",
+        "expected_intent": "tabular_groupby",
+        "expected_filter_column": None,
+        "expected_time_grain": "month",
+    },
 ]
 
 
@@ -533,6 +539,8 @@ def evaluate_tabular_plans(
     schema_hits = 0
     distinct_hits = 0
     compare_hits = 0
+    catalog_hits = 0
+    temporal_hits = 0
     details: list[dict] = []
 
     metric_cases = 0
@@ -541,6 +549,8 @@ def evaluate_tabular_plans(
     schema_cases = 0
     distinct_cases = 0
     compare_cases = 0
+    catalog_cases = 0
+    temporal_cases = 0
 
     for case in cases:
         plan = planner_fn(case["question"]) or {}
@@ -574,6 +584,14 @@ def evaluate_tabular_plans(
             compare_cases += 1
             if plan.get("intent") == "tabular_compare":
                 compare_hits += 1
+        if case.get("expected_intent") == "tabular_groupby" and case.get("expected_time_grain"):
+            temporal_cases += 1
+            if plan.get("intent") == "tabular_groupby" and plan.get("time_grain") == case.get("expected_time_grain"):
+                temporal_hits += 1
+        if str(case.get("expected_intent", "")).startswith("catalog_"):
+            catalog_cases += 1
+            if plan.get("intent") == case.get("expected_intent"):
+                catalog_hits += 1
         details.append(
             {
                 "question": case["question"],
@@ -583,6 +601,8 @@ def evaluate_tabular_plans(
                 "filters": plan.get("filters", []),
                 "expected_unit": case.get("expected_unit", ""),
                 "actual_unit": plan.get("expected_unit", ""),
+                "expected_time_grain": case.get("expected_time_grain", ""),
+                "actual_time_grain": plan.get("time_grain", ""),
             }
         )
 
@@ -596,6 +616,8 @@ def evaluate_tabular_plans(
             "schema_question_success_rate": round(schema_hits / max(1, schema_cases), 4),
             "distinct_question_success_rate": round(distinct_hits / max(1, distinct_cases), 4),
             "compare_question_success_rate": round(compare_hits / max(1, compare_cases), 4),
+            "temporal_question_success_rate": round(temporal_hits / max(1, temporal_cases), 4),
+            "catalog_question_success_rate": round(catalog_hits / max(1, catalog_cases), 4),
         },
         "details": details,
     }
@@ -621,8 +643,7 @@ def load_tabular_gold_dataset(path: str | Path | None = None) -> dict:
     }
 
 
-def evaluate_tabular_benchmark(path: str | Path | None = None) -> dict[str, object]:
-    dataset = load_tabular_gold_dataset(path)
+def _evaluate_tabular_dataset(dataset: dict, dataset_label: str) -> dict[str, object]:
     profiles = list(dataset.get("profiles", []))
     context_hint = str(dataset.get("context_hint", ""))
     cases = list(dataset.get("cases", []))
@@ -635,6 +656,35 @@ def evaluate_tabular_benchmark(path: str | Path | None = None) -> dict[str, obje
         return validation.normalized_plan if validation.valid else None
 
     report = evaluate_tabular_plans(planner_fn, gold_cases=cases)
-    report["dataset"] = str(path) if path is not None else "embedded_tabular_gold_ptbr"
+    report["dataset"] = dataset_label
     report["context_hint"] = context_hint
     return report
+
+
+def evaluate_tabular_benchmark(path: str | Path | None = None) -> dict[str, object]:
+    dataset = load_tabular_gold_dataset(path)
+    if "suites" in dataset:
+        suites: dict[str, dict[str, object]] = {}
+        total_cases = 0
+        all_details: list[dict] = []
+        summary_accumulator: dict[str, list[float]] = {}
+        for suite_name, suite_dataset in dataset["suites"].items():
+            report = _evaluate_tabular_dataset(
+                suite_dataset,
+                dataset_label=f"{str(path) if path is not None else 'embedded_tabular_gold_ptbr'}::{suite_name}",
+            )
+            suites[suite_name] = report
+            total_cases += int(report.get("cases", 0) or 0)
+            all_details.extend(report.get("details", []))
+            for key, value in (report.get("summary", {}) or {}).items():
+                summary_accumulator.setdefault(key, []).append(float(value))
+        summary = {key: round(sum(values) / max(1, len(values)), 4) for key, values in summary_accumulator.items()}
+        return {
+            "cases": total_cases,
+            "summary": summary,
+            "details": all_details,
+            "dataset": str(path) if path is not None else "embedded_tabular_gold_ptbr",
+            "context_hint": None,
+            "suites": suites,
+        }
+    return _evaluate_tabular_dataset(dataset, str(path) if path is not None else "embedded_tabular_gold_ptbr")

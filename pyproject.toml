@@ -30,6 +30,8 @@ dependencies = [
     "docling>=2.80",
     # Structured retrieval
     "duckdb>=1.0",
+    # Observability
+    "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]

@@ -2,6 +2,21 @@
 from __future__ import annotations
 
 
+def _as_date_sql(column: str, backend: str) -> str:
+    if backend == "sqlite":
+        return f"date(CAST({column} AS TEXT))"
+    return f"TRY_CAST({column} AS DATE)"
+
+
+def _date_bucket_sql(column: str, backend: str, grain: str | None) -> str:
+    date_expr = _as_date_sql(column, backend)
+    if grain == "year":
+        return f"strftime({date_expr}, '%Y')"
+    if grain == "month":
+        return f"strftime({date_expr}, '%Y-%m')"
+    return f"strftime({date_expr}, '%Y-%m-%d')"
+
+
 def _as_float_sql(column: str, backend: str) -> str:
     if backend == "sqlite":
         text_expr = f"TRIM(CAST({column} AS TEXT))"
@@ -38,6 +53,10 @@ def build_sql_for_plan(table: str, plan: dict, backend: str = "duckdb") -> tuple
         elif operator == "!=":
             where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) <> ?")
             params.append(str(value).strip().lower())
+        elif operator == "between":
+            start, end = [part.strip() for part in str(value).split("|", 1)]
+            where_parts.append(f"{_as_date_sql(column, backend)} BETWEEN ? AND ?")
+            params.extend([start, end])
         else:
             where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) = ?")
             params.append(str(value).strip().lower())
@@ -68,11 +87,24 @@ def build_sql_for_plan(table: str, plan: dict, backend: str = "duckdb") -> tuple
 
     if intent in {"tabular_groupby", "tabular_compare"}:
         group_by = [col for col in plan.get("group_by", []) if col]
-        group_clause = ", ".join(group_by)
+        time_grain = plan.get("time_grain")
+        group_exprs: list[str] = []
+        select_group_exprs: list[str] = []
+        for col in group_by:
+            if time_grain:
+                bucket_expr = _date_bucket_sql(col, backend, time_grain)
+                group_exprs.append(bucket_expr)
+                select_group_exprs.append(f"{bucket_expr} AS {col}")
+            else:
+                group_exprs.append(col)
+                select_group_exprs.append(col)
+        group_clause = ", ".join(group_exprs)
+        select_group_clause = ", ".join(select_group_exprs)
         metric_expr = "COUNT(*)" if aggregation == "count" or not metric else f"{aggregation.upper()}({_as_float_sql(metric, backend)})"
+        order_clause = ", ".join(group_exprs) if time_grain else "value DESC NULLS LAST"
         sql = (
-            f"SELECT {group_clause}, {metric_expr} AS value FROM {table} {where_clause} "
-            f"GROUP BY {group_clause} ORDER BY value DESC NULLS LAST LIMIT ?"
+            f"SELECT {select_group_clause}, {metric_expr} AS value FROM {table} {where_clause} "
+            f"GROUP BY {group_clause} ORDER BY {order_clause} LIMIT ?"
         )
         return sql, [*params, limit]
 

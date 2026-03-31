@@ -25,6 +25,9 @@ nltk>=3.8
 pymupdf>=1.24
 docling>=2.80
 
+# Observability
+prometheus-client>=0.21
+
 # Dev / tests
 pytest>=8
 pytest-asyncio>=0.23

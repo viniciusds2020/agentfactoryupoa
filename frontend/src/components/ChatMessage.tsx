@@ -11,6 +11,8 @@ const PROFILE_LABELS: Record<string, string> = {
 
 export default function ChatMessage({ msg, domainProfile }: { msg: Message; domainProfile?: string }) {
   const isUser = msg.role === 'user'
+  const firstSource = msg.sources?.[0]
+  const catalogBadge = !isUser && firstSource?.source_kind === 'table_query' && firstSource?.citation_label === 'registro de catalogo'
 
   return (
     <div className={`chat-row ${isUser ? 'user' : 'assistant'}`}>
@@ -18,6 +20,7 @@ export default function ChatMessage({ msg, domainProfile }: { msg: Message; doma
         <div className="bubble-meta">
           {isUser ? 'Voce' : 'Agent Factory'}
           {!isUser && domainProfile ? <span className="bubble-profile">{PROFILE_LABELS[domainProfile] || domainProfile}</span> : null}
+          {catalogBadge ? <span className="bubble-badge">Resposta por Catalogo/Codigos</span> : null}
         </div>
         {isUser ? (
           <div className="msg-prose">{msg.content}</div>

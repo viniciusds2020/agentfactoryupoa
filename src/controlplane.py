@@ -690,6 +690,30 @@ def replace_value_catalog(
                     )
 
 
+def list_value_catalog(workspace_id: str, collection: str) -> dict[str, list[dict]]:
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            """
+            SELECT column_name, normalized_value, raw_value, frequency
+            FROM value_catalog
+            WHERE workspace_id=? AND collection=?
+            ORDER BY column_name ASC, frequency DESC, raw_value ASC
+            """,
+            (workspace_id, collection),
+        ).fetchall()
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        item = dict(row)
+        grouped.setdefault(str(item["column_name"]), []).append(
+            {
+                "normalized_value": item.get("normalized_value", ""),
+                "raw_value": item.get("raw_value", ""),
+                "frequency": int(item.get("frequency", 0) or 0),
+            }
+        )
+    return grouped
+
+
 def log_query_plan(
     workspace_id: str,
     collection: str,

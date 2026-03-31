@@ -99,7 +99,11 @@ FAISS_HNSW_EF_SEARCH=64
 - **Roteador de intencao**: classifica queries em `count_structural`, `list_structural`, `locate_structural`, `contains_structural`, `summary_structural`, `question_structural`, `question_factual`, `locate_excerpt`, `comparison`
 - **Structure-first automatico para navegacao documental**: perguntas como "quantos capitulos tem?", "quais artigos estao no capitulo II?" e "o capitulo V tem secao III?" sao respondidas direto pela estrutura da Prata, sem depender do vetor
 - **Table-first para planilhas e CSV**: perguntas analiticas como "qual e a renda do estado do Rio de Janeiro?" sao planejadas e executadas no store estruturado antes da RAG textual
+- **Catalog-first para codigos e tabelas de referencia**: tabelas de procedimentos, rol, coberturas e regras operacionais passam a responder por lookup de registro, descricao, cobertura, prazo e autorizacao em vez de agregacoes numericas
 - **Fontes analiticas explicitas**: quando a resposta vem de consulta tabular, a interface mostra a consulta analitica executada e um resumo do resultado em vez de top 5 trechos
+- **Badge visual no chat para catalogo**: respostas vindas do modo `Catalogo/Codigos` exibem um selo explicito (`Resposta por Catalogo/Codigos`)
+- **Sugestao automatica de modo antes do upload**: a aba de ingestao analisa nome/extensao do arquivo e sugere `Conversa Geral`, `Juridico/Contratos` ou `Planilhas/Tabelas`; para tabular, tambem sugere subtipo `Catalogo/Codigos` ou `Analitico`
+- **Exemplos reais no painel semantico**: a inspecao da base mostra exemplos concretos por coluna a partir do `value_catalog`
 - **Shortcut para sumarizacao estrutural**: "resuma o capitulo X" usa resumo pre-computado quando existir; se nao existir, resolve o escopo direto pelo artefato JSON da Prata e gera resumo on-demand
 - **Fallback deterministico para summary**: se o LLM falhar ou devolver JSON invalido, o sistema gera um resumo extrativo local (`fallback_only`) em vez de falhar
 - **Limpeza estrutural pesada**: merge de linhas quebradas, deduplicacao de paragrafos, remocao de numeros de pagina orfaos
@@ -122,6 +126,7 @@ Navegador (UI embutida ou React)
 FastAPI (app.py)
    |--- Chat (hibrido + reranking + streaming SSE)
    |    |--- Table-first: agregacao/group-by/ranking em DuckDB/SQLite para planilhas e CSV
+   |    |--- Catalog-first: lookup por codigo/descricao/cobertura/autorizacao para tabelas de catalogo
    |    |--- Roteador de intencao (count / list / locate / contains / summary / question / comparison)
    |    |--- Structure-first: contagem, inventario, localizacao e composicao estrutural via artefato JSON da Prata
    |    |--- Shortcut: resumo pre-computado (quando summary_structural)
@@ -316,6 +321,13 @@ Exemplos:
 - "O que significa a coluna score_credito?"
 - "Compare SP e RJ em renda media"
 
+Para tabelas com perfil de catalogo/codigos, o sistema tambem cobre:
+- "Qual e o procedimento com esse id 20017?"
+- "Qual e o codigo da Visita Domiciliar?"
+- "Qual a cobertura do 20017?"
+- "Qual o prazo de autorizacao do 20017?"
+- "Resuma o procedimento 20017"
+
 Fluxo:
 1. identificar que a pergunta e tabular/analitica
 2. carregar o perfil semantico da base (`table_profile`, `column_profiles`, `value_catalog`)
@@ -334,7 +346,9 @@ Quando a resposta vem de `table-first`, a interface nao trata o resultado como "
 No frontend, a aba de ingestao tambem expõe a **inspecao semantica da base**:
 - `table_profile` da colecao
 - `column_profiles` com tipo fisico, tipo semantico, unidade, aliases e operacoes permitidas
+- `value_catalog` com exemplos reais por coluna
 - resumo do benchmark tabular
+- sugestao automatica de modo antes do primeiro upload
 
 ### Arquitetura Semantica Tabular
 
@@ -358,14 +372,44 @@ A camada de planilhas/tabelas foi evoluida para um fluxo `schema-first` e `LLM-l
      - `tabular_groupby`
      - `tabular_rank`
      - `tabular_distinct`
-     - `tabular_schema`
-     - `tabular_describe_column`
+      - `tabular_schema`
+      - `tabular_describe_column`
+      - `catalog_lookup_by_id`
+      - `catalog_lookup_by_title`
+      - `catalog_field_lookup`
+      - `catalog_record_summary`
+      - `catalog_compare`
 4. **Validator**
    - impede agregacoes incoerentes, como idade sendo renderizada como moeda
 5. **SQL builder**
    - gera SQL seguro a partir do plano validado
 6. **Semantic renderer**
    - transforma o resultado em resposta de negocio com unidade correta
+
+### Catalog-first para Codigos e Procedimentos
+
+Quando a tabela detectada tem perfil de catalogo (`table_type=catalog`), o sistema muda de comportamento:
+
+1. trata colunas como `procedimento` e `codigo` como `identifier`, nunca como metrica
+2. identifica uma coluna principal de titulo/descricao (`catalog_title`)
+3. classifica atributos como cobertura, prazo e autorizacao como campos descritivos
+4. responde por **lookup exato ou normalizado**, e nao por soma/media
+
+Fluxo:
+1. detectar que a tabela parece catalogo
+2. escolher o modo `Catalogo/Codigos` no perfil semantico da base
+3. rotear perguntas para intents como `catalog_lookup_by_id` e `catalog_field_lookup`
+4. localizar o registro correto
+5. responder em linguagem natural com os atributos relevantes
+
+Na UI, o painel semantico da aba de ingestao agora mostra explicitamente:
+- `Planilhas/Tabelas analiticas`
+- `Catalogo/Codigos`
+
+No chat, quando a resposta vem de `catalog-first`, a mensagem tambem recebe um badge visual:
+- `Resposta por Catalogo/Codigos`
+
+Isso evita respostas absurdas como media de `procedimento` e melhora PDFs tabulares de regras, codigos e rol assistencial.
 
 ### Persistencia de Metadados Tabulares
 
@@ -386,8 +430,31 @@ Existe um benchmark tabular dedicado com dataset ouro em `data/eval/tabular_gold
 - schema da tabela
 - descricao semantica de coluna
 - comparacao executiva entre grupos
+- lookup de procedimento por codigo
+- lookup de codigo por descricao
+- cobertura, prazo e autorizacao em tabelas de catalogo
+- resumo de registro de catalogo
 
 O endpoint `/evaluation/tabular` expõe esse snapshot para acompanhamento da qualidade do planner semântico.
+
+### Refinamentos de UX Tabular
+
+Para reduzir ambiguidade no uso por pessoas nao tecnicas, a experiencia tabular agora inclui:
+
+1. **Sugestao pre-upload de modo da base**
+   - heuristica local baseada em extensao e nome do arquivo
+   - exemplos:
+     - `.csv`, `.xlsx`, `.xls` -> `Planilhas/Tabelas`
+     - nomes com `procedimento`, `rol`, `codigo`, `cobertura` -> subtipo `Catalogo/Codigos`
+     - nomes com `estatuto`, `contrato`, `regulamento` -> `Juridico/Contratos`
+
+2. **Sinalizacao visual no chat**
+   - respostas de catalogo exibem badge explicito
+   - ajuda o usuario a entender que a resposta veio de lookup estruturado, e nao de RAG textual
+
+3. **Inspecao semantica com exemplos reais**
+   - cada coluna pode exibir valores reais amostrados da base
+   - isso facilita auditoria de semantic_type, aliases e operacoes permitidas
 
 ## Limpeza Estrutural
 

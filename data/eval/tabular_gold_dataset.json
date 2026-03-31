@@ -1,102 +1,76 @@
 {
-  "context_hint": "Base de cadastro de clientes pessoa fisica. idade em anos. renda_mensal em BRL. score_credito em pontos. estado e a UF do cliente. status_cadastro indica situacao comercial.",
-  "profiles": [
-    {
-      "name": "id_cliente",
-      "role": "identifier",
-      "semantic_type": "identifier",
-      "unit": "text",
-      "aliases": ["id", "id cliente", "id_cliente"]
+  "suites": {
+    "analytic": {
+      "context_hint": "Base de cadastro de clientes pessoa fisica. idade em anos. renda_mensal em BRL. score_credito em pontos. estado e a UF do cliente. status_cadastro indica situacao comercial.",
+      "profiles": [
+        {"name": "id_cliente", "role": "identifier", "semantic_type": "identifier", "unit": "text", "aliases": ["id", "id cliente", "id_cliente"]},
+        {"name": "idade", "role": "metric", "semantic_type": "measure_age_years", "unit": "anos", "aliases": ["idade", "idade do cliente"]},
+        {"name": "renda_mensal", "role": "metric", "semantic_type": "measure_currency", "unit": "brl", "aliases": ["renda", "renda mensal", "salario"]},
+        {"name": "score_credito", "role": "metric", "semantic_type": "measure_score", "unit": "pontos", "aliases": ["score", "score credito", "score_credito"]},
+        {"name": "cidade", "role": "dimension", "semantic_type": "dimension_geo_city", "unit": "text", "aliases": ["cidade", "municipio"]},
+        {"name": "estado", "role": "dimension", "semantic_type": "dimension_geo_state", "unit": "text", "aliases": ["estado", "uf"]},
+        {"name": "segmento", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["segmento", "categoria"]},
+        {"name": "status_cadastro", "role": "dimension", "semantic_type": "dimension_status", "unit": "text", "aliases": ["status", "status cadastro"]},
+        {"name": "data_cadastro", "role": "date", "semantic_type": "date", "unit": "date", "aliases": ["data cadastro", "data", "cadastro"]}
+      ],
+      "cases": [
+        {"question": "Qual e a media de idade dos clientes do Ceara?", "expected_intent": "tabular_aggregate", "expected_metric": "idade", "expected_filter_column": "estado", "expected_unit": "anos"},
+        {"question": "Qual e a renda total no estado de Sao Paulo?", "expected_intent": "tabular_aggregate", "expected_metric": "renda_mensal", "expected_filter_column": "estado", "expected_unit": "brl"},
+        {"question": "Quantos clientes ativos existem em MG?", "expected_intent": "tabular_count", "expected_filter_column": "estado", "expected_unit": "count"},
+        {"question": "Quais sao os estados UF da tabela?", "expected_intent": "tabular_distinct", "expected_dimension": "estado"},
+        {"question": "Quais sao as colunas da tabela?", "expected_intent": "tabular_schema"},
+        {"question": "O que significa a coluna score_credito?", "expected_intent": "tabular_describe_column"},
+        {"question": "Compare SP e RJ em renda media", "expected_intent": "tabular_compare", "expected_metric": "renda_mensal", "expected_unit": "brl"},
+        {"question": "Quantos cadastros por mes?", "expected_intent": "tabular_groupby", "expected_time_grain": "month"}
+      ]
     },
-    {
-      "name": "idade",
-      "role": "metric",
-      "semantic_type": "measure_age_years",
-      "unit": "anos",
-      "aliases": ["idade", "idade do cliente"]
+    "catalog": {
+      "context_hint": "Catalogo de procedimentos e codigos da Unimed. procedimento e o codigo identificador. descricao_unimed_poa e o nome principal do procedimento. cobertura, prazo e orientacao_autorizacao sao atributos descritivos do catalogo.",
+      "profiles": [
+        {"name": "procedimento", "role": "identifier", "semantic_type": "identifier", "unit": "text", "aliases": ["procedimento", "codigo", "id"]},
+        {"name": "descricao_unimed_poa", "role": "text", "semantic_type": "catalog_title", "unit": "text", "aliases": ["descricao", "descricao unimed poa", "titulo"]},
+        {"name": "cobertura_unimed_poa", "role": "text", "semantic_type": "coverage_rule", "unit": "text", "aliases": ["cobertura", "cobertura unimed poa"]},
+        {"name": "segmentacao_ans", "role": "text", "semantic_type": "catalog_attribute", "unit": "text", "aliases": ["segmentacao", "segmentacao ans"]},
+        {"name": "emergencia", "role": "text", "semantic_type": "catalog_attribute", "unit": "text", "aliases": ["emergencia"]},
+        {"name": "prazo_autorizacao", "role": "text", "semantic_type": "deadline_rule", "unit": "text", "aliases": ["prazo", "prazo autorizacao"]},
+        {"name": "orientacao_autorizacao", "role": "text", "semantic_type": "authorization_rule", "unit": "text", "aliases": ["autorizacao", "orientacao autorizacao"]}
+      ],
+      "cases": [
+        {"question": "Qual e o procedimento com esse id 20017?", "expected_intent": "catalog_lookup_by_id"},
+        {"question": "Qual e o codigo da Visita Domiciliar?", "expected_intent": "catalog_lookup_by_title"},
+        {"question": "Qual a cobertura do 20017?", "expected_intent": "catalog_field_lookup"},
+        {"question": "Qual o prazo de autorizacao do 20017?", "expected_intent": "catalog_field_lookup"},
+        {"question": "Resuma o procedimento 20017", "expected_intent": "catalog_record_summary"},
+        {"question": "Compare 10049 e 20017", "expected_intent": "catalog_compare"}
+      ]
     },
-    {
-      "name": "renda_mensal",
-      "role": "metric",
-      "semantic_type": "measure_currency",
-      "unit": "brl",
-      "aliases": ["renda", "renda mensal", "salario"]
+    "time_series": {
+      "context_hint": "Base de vendas mensal com data_venda, valor_total, quantidade e canal. A analise temporal por mes e ano e relevante para acompanhar tendencia.",
+      "profiles": [
+        {"name": "id_venda", "role": "identifier", "semantic_type": "identifier", "unit": "text", "aliases": ["id", "id venda", "pedido"]},
+        {"name": "data_venda", "role": "date", "semantic_type": "date", "unit": "date", "aliases": ["data venda", "data", "venda"]},
+        {"name": "valor_total", "role": "metric", "semantic_type": "measure_currency", "unit": "brl", "aliases": ["valor", "valor total", "receita"]},
+        {"name": "quantidade", "role": "metric", "semantic_type": "measure_number", "unit": "number", "aliases": ["quantidade", "volume"]},
+        {"name": "canal", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["canal"]}
+      ],
+      "cases": [
+        {"question": "Qual a receita por mes?", "expected_intent": "tabular_groupby", "expected_metric": "valor_total", "expected_unit": "brl", "expected_time_grain": "month"},
+        {"question": "Qual a quantidade por ano?", "expected_intent": "tabular_groupby", "expected_metric": "quantidade", "expected_unit": "number", "expected_time_grain": "year"}
+      ]
     },
-    {
-      "name": "score_credito",
-      "role": "metric",
-      "semantic_type": "measure_score",
-      "unit": "pontos",
-      "aliases": ["score", "score credito", "score_credito"]
-    },
-    {
-      "name": "cidade",
-      "role": "dimension",
-      "semantic_type": "dimension_geo_city",
-      "unit": "text",
-      "aliases": ["cidade", "municipio"]
-    },
-    {
-      "name": "estado",
-      "role": "dimension",
-      "semantic_type": "dimension_geo_state",
-      "unit": "text",
-      "aliases": ["estado", "uf"]
-    },
-    {
-      "name": "segmento",
-      "role": "dimension",
-      "semantic_type": "dimension_category",
-      "unit": "text",
-      "aliases": ["segmento", "categoria"]
-    },
-    {
-      "name": "status_cadastro",
-      "role": "dimension",
-      "semantic_type": "dimension_status",
-      "unit": "text",
-      "aliases": ["status", "status cadastro"]
+    "transactional": {
+      "context_hint": "Base transacional de pedidos com data_pedido, valor_total, status e canal. Perguntas costumam combinar filtros por status com agregacoes e contagens.",
+      "profiles": [
+        {"name": "id_pedido", "role": "identifier", "semantic_type": "identifier", "unit": "text", "aliases": ["id", "pedido", "id pedido"]},
+        {"name": "data_pedido", "role": "date", "semantic_type": "date", "unit": "date", "aliases": ["data pedido", "data"]},
+        {"name": "valor_total", "role": "metric", "semantic_type": "measure_currency", "unit": "brl", "aliases": ["valor", "valor total", "faturamento"]},
+        {"name": "status", "role": "dimension", "semantic_type": "dimension_status", "unit": "text", "aliases": ["status"]},
+        {"name": "canal", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["canal"]}
+      ],
+      "cases": [
+        {"question": "Quantos pedidos aprovados existem?", "expected_intent": "tabular_count", "expected_unit": "count"},
+        {"question": "Qual o valor total dos pedidos aprovados?", "expected_intent": "tabular_aggregate", "expected_metric": "valor_total", "expected_unit": "brl"}
+      ]
     }
-  ],
-  "cases": [
-    {
-      "question": "Qual e a media de idade dos clientes do Ceara?",
-      "expected_intent": "tabular_aggregate",
-      "expected_metric": "idade",
-      "expected_filter_column": "estado",
-      "expected_unit": "anos"
-    },
-    {
-      "question": "Qual e a renda total no estado de Sao Paulo?",
-      "expected_intent": "tabular_aggregate",
-      "expected_metric": "renda_mensal",
-      "expected_filter_column": "estado",
-      "expected_unit": "brl"
-    },
-    {
-      "question": "Quantos clientes ativos existem em MG?",
-      "expected_intent": "tabular_count",
-      "expected_filter_column": "estado",
-      "expected_unit": "count"
-    },
-    {
-      "question": "Quais sao os estados UF da tabela?",
-      "expected_intent": "tabular_distinct",
-      "expected_dimension": "estado"
-    },
-    {
-      "question": "Quais sao as colunas da tabela?",
-      "expected_intent": "tabular_schema"
-    },
-    {
-      "question": "O que significa a coluna score_credito?",
-      "expected_intent": "tabular_describe_column"
-    },
-    {
-      "question": "Compare SP e RJ em renda media",
-      "expected_intent": "tabular_compare",
-      "expected_metric": "renda_mensal",
-      "expected_unit": "brl"
-    }
-  ]
+  }
 }

@@ -29,6 +29,7 @@ from src.controlplane import (
     get_document,
     get_ingestion_job,
     get_table_profile,
+    list_value_catalog,
     list_audit_events,
     list_column_profiles,
     list_collection_stats,
@@ -81,9 +82,17 @@ class RequestIdMiddleware:
                 message["headers"] = headers
             await send(message)
 
+        from src.observability import REQUESTS_TOTAL, REQUEST_DURATION
+        from time import perf_counter
+
+        method = scope.get("method", "GET")
+        path = scope.get("path", "/")
+        start = perf_counter()
         try:
             await self.app(scope, receive, send_with_request_id)
         finally:
+            REQUESTS_TOTAL.labels(endpoint=path, method=method).inc()
+            REQUEST_DURATION.labels(endpoint=path).observe(perf_counter() - start)
             request_id_var.reset(token)
 
 
@@ -109,6 +118,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+v1_router = APIRouter(prefix="/api/v1")
 
 
 # ── Error handling ───────────────────────────────────────────────────────────
@@ -291,6 +302,7 @@ class TableProfileOut(BaseModel):
     table_name: str
     base_context: str
     subject_label: str
+    table_type: str = "analytic"
     created_at: str
     updated_at: str
 
@@ -315,6 +327,7 @@ class CollectionSemanticProfileOut(BaseModel):
     collection: str
     profile: TableProfileOut | None = None
     columns: list[ColumnProfileOut]
+    value_catalog: dict[str, list[dict]] = {}
 
 
 class CollectionStatsOut(BaseModel):
@@ -356,6 +369,7 @@ class TabularEvaluationOut(BaseModel):
     details: list[dict]
     dataset: str | None = None
     context_hint: str | None = None
+    suites: dict[str, dict] | None = None
 
 
 class AuditEventOut(BaseModel):
@@ -709,12 +723,21 @@ async def health() -> HealthResponse:
     )
 
 
+@app.get("/metrics")
+async def prometheus_metrics_endpoint():
+    """Prometheus metrics endpoint for Grafana / alerting integration."""
+    from starlette.responses import Response
+    from src.observability import prometheus_metrics
+
+    return Response(content=prometheus_metrics(), media_type="text/plain; version=0.0.4")
+
+
 class CollectionInfo(BaseModel):
     collection: str
     embedding_model: str
 
 
-@app.get("/collections/available", response_model=list[CollectionInfo])
+@v1_router.get("/collections/available", response_model=list[CollectionInfo])
 async def list_available_collections(request: Request):
     workspace = _get_workspace(request)
     return [
@@ -723,7 +746,7 @@ async def list_available_collections(request: Request):
     ]
 
 
-@app.post("/ingest", response_model=IngestResponse)
+@v1_router.post("/ingest", response_model=IngestResponse)
 async def ingest_document(
     request: Request,
     collection: str = Form(...),
@@ -902,7 +925,7 @@ async def ingest_document(
 
 
 
-@app.post("/chat", response_model=ChatResponse)
+@v1_router.post("/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
     workspace = _get_workspace(request)
     client_ip = request.client.host if request.client else "unknown"
@@ -942,7 +965,7 @@ def chat_endpoint(req: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
-@app.get("/conversations", response_model=list[ConversationOut])
+@v1_router.get("/conversations", response_model=list[ConversationOut])
 def list_convs(request: Request, q: str = Query(default="", alias="q")):
     from src.history import list_conversations, search_conversations
 
@@ -955,7 +978,7 @@ def list_convs(request: Request, q: str = Query(default="", alias="q")):
     return [ConversationOut(**c.__dict__) for c in convs]
 
 
-@app.post("/conversations", response_model=ConversationOut)
+@v1_router.post("/conversations", response_model=ConversationOut)
 def create_conv(req: CreateConversationRequest, request: Request):
     from src.history import create_conversation, get_conversation
 
@@ -972,7 +995,7 @@ def create_conv(req: CreateConversationRequest, request: Request):
 
 
 
-@app.get("/conversations/{conv_id}/messages", response_model=list[MessageOut])
+@v1_router.get("/conversations/{conv_id}/messages", response_model=list[MessageOut])
 def get_messages(conv_id: str, request: Request):
     from src.history import get_conversation, load_messages
 
@@ -991,7 +1014,7 @@ def get_messages(conv_id: str, request: Request):
     ]
 
 
-@app.patch("/conversations/{conv_id}", response_model=ConversationOut)
+@v1_router.patch("/conversations/{conv_id}", response_model=ConversationOut)
 def rename_conv(conv_id: str, req: RenameRequest, request: Request):
     from src.history import rename_conversation, get_conversation
 
@@ -1006,7 +1029,7 @@ def rename_conv(conv_id: str, req: RenameRequest, request: Request):
     return ConversationOut(**conv.__dict__)
 
 
-@app.delete("/conversations/{conv_id}", status_code=204)
+@v1_router.delete("/conversations/{conv_id}", status_code=204)
 def delete_conv(conv_id: str, request: Request):
     from src.history import delete_conversation, get_conversation
 
@@ -1017,7 +1040,7 @@ def delete_conv(conv_id: str, request: Request):
     delete_conversation(conv_id)
 
 
-@app.post("/chat/message", response_model=ChatWithHistoryResponse)
+@v1_router.post("/chat/message", response_model=ChatWithHistoryResponse)
 def chat_message(req: ChatWithHistoryRequest, request: Request) -> ChatWithHistoryResponse:
     workspace = _get_workspace(request)
     actor = _actor_from_request(request)
@@ -1106,7 +1129,7 @@ def chat_message(req: ChatWithHistoryRequest, request: Request) -> ChatWithHisto
 # ── Streaming chat ────────────────────────────────────────────────────────────
 
 
-@app.post("/chat/message/stream")
+@v1_router.post("/chat/message/stream")
 async def chat_message_stream(req: ChatWithHistoryRequest, request: Request):
     """SSE endpoint — streams LLM tokens as they arrive."""
     import json as _json
@@ -1255,7 +1278,7 @@ async def chat_message_stream(req: ChatWithHistoryRequest, request: Request):
 # ── Documents (available in both modes for the simple UI doc list) ────────────
 
 
-@app.get("/documents", response_model=list[DocumentOut])
+@v1_router.get("/documents", response_model=list[DocumentOut])
 def get_documents(request: Request, collection: str | None = Query(default=None)):
     workspace = _get_workspace(request)
     if collection is not None:
@@ -1264,7 +1287,7 @@ def get_documents(request: Request, collection: str | None = Query(default=None)
     return [DocumentOut(**doc.__dict__) for doc in docs]
 
 
-@app.patch("/collections/{collection}/context", response_model=CollectionContextOut)
+@v1_router.patch("/collections/{collection}/context", response_model=CollectionContextOut)
 def patch_collection_context(collection: str, req: UpdateCollectionContextRequest, request: Request):
     workspace = _get_workspace(request)
     collection = _validate_collection_or_422(collection)
@@ -1278,12 +1301,13 @@ def patch_collection_context(collection: str, req: UpdateCollectionContextReques
     )
 
 
-@app.get("/collections/{collection}/semantic-profile", response_model=CollectionSemanticProfileOut)
+@v1_router.get("/collections/{collection}/semantic-profile", response_model=CollectionSemanticProfileOut)
 def get_collection_semantic_profile(collection: str, request: Request):
     workspace = _get_workspace(request)
     collection = _validate_collection_or_422(collection)
     profile = get_table_profile(workspace.id, collection)
     columns = list_column_profiles(workspace.id, collection)
+    value_catalog = list_value_catalog(workspace.id, collection)
     if not profile and not columns:
         try:
             from src.structured_store import has_structured_data, persist_table_semantics
@@ -1296,8 +1320,19 @@ def get_collection_semantic_profile(collection: str, request: Request):
                 )
                 profile = get_table_profile(workspace.id, collection)
                 columns = list_column_profiles(workspace.id, collection)
+                value_catalog = list_value_catalog(workspace.id, collection)
         except Exception:
             pass
+    if profile:
+        if not profile.get("table_type"):
+            try:
+                from src.structured_store import get_table_profile as get_runtime_table_profile
+
+                runtime_profile = get_runtime_table_profile(collection, context_hint=str(profile.get("base_context") or ""))
+                runtime_type = runtime_profile.get("table_type") if isinstance(runtime_profile, dict) else None
+                profile = {**profile, "table_type": runtime_type or "analytic"}
+            except Exception:
+                profile = {**profile, "table_type": "analytic"}
     return CollectionSemanticProfileOut(
         collection=collection,
         profile=TableProfileOut(**profile) if profile else None,
@@ -1319,10 +1354,11 @@ def get_collection_semantic_profile(collection: str, request: Request):
             )
             for item in columns
         ],
+        value_catalog=value_catalog,
     )
 
 
-@app.delete("/documents/{doc_id}", status_code=204)
+@v1_router.delete("/documents/{doc_id}", status_code=204)
 def delete_document(doc_id: str, request: Request, collection: str = Query(...), embedding_model: str | None = Query(default=None)):
     from src import chat, vectordb
 
@@ -1354,7 +1390,7 @@ def delete_document(doc_id: str, request: Request, collection: str = Query(...),
     )
 
 
-@app.get("/documents/{doc_id}/artifacts", response_model=DocumentArtifactsOut)
+@v1_router.get("/documents/{doc_id}/artifacts", response_model=DocumentArtifactsOut)
 def get_document_artifacts(
     doc_id: str,
     request: Request,
@@ -1392,7 +1428,7 @@ def get_document_artifacts(
     )
 
 
-@app.get("/documents/{doc_id}/artifacts/download")
+@v1_router.get("/documents/{doc_id}/artifacts/download")
 def download_document_artifact(
     doc_id: str,
     request: Request,
@@ -1418,7 +1454,7 @@ def download_document_artifact(
 
 # ── Enterprise routes (hidden when simple_mode=True) ─────────────────────────
 
-enterprise_router = APIRouter()
+enterprise_router = APIRouter(prefix="/api/v1")
 
 
 @enterprise_router.get("/settings", response_model=SettingsOut)
@@ -1562,6 +1598,8 @@ def purge_conversations_enterprise(older_than_days: int = Query(default=90, ge=1
     deleted = purge_old_conversations(older_than_days)
     return {"deleted": deleted, "older_than_days": older_than_days}
 
+
+app.include_router(v1_router)
 
 if not settings.simple_mode:
     app.include_router(enterprise_router)

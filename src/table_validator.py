@@ -14,14 +14,24 @@ _ALLOWED_BY_SEMANTIC = {
     "measure_currency": {"sum", "avg", "min", "max"},
     "measure_age_years": {"avg", "min", "max"},
     "measure_score": {"avg", "min", "max"},
+    "measure_percentage": {"avg", "min", "max"},
     "measure_number": {"sum", "avg", "min", "max"},
     "identifier": set(),
+    "catalog_title": set(),
+    "catalog_attribute": set(),
+    "coverage_rule": set(),
+    "authorization_rule": set(),
+    "deadline_rule": set(),
+    "dimension_person": set(),
+    "dimension_organization": set(),
     "dimension_geo_state": set(),
     "dimension_geo_city": set(),
     "dimension_status": set(),
     "dimension_category": set(),
+    "flag_boolean": set(),
     "text": set(),
     "date": set(),
+    "datetime": set(),
 }
 
 
@@ -51,6 +61,9 @@ def validate_query_plan(plan: dict, profiles: list[dict]) -> ValidationResult:
         for group_col in plan.get("group_by", []) or []:
             if group_col not in profile_map:
                 errors.append(f"group_by desconhecida: {group_col}")
+        time_grain = plan.get("time_grain")
+        if time_grain and not any(profile_map.get(group_col, {}).get("semantic_type") in {"date", "datetime"} for group_col in plan.get("group_by", []) or []):
+            errors.append("time_grain requer group_by com coluna de data")
 
     if intent == "tabular_count":
         normalized["aggregation"] = "count"
@@ -72,6 +85,18 @@ def validate_query_plan(plan: dict, profiles: list[dict]) -> ValidationResult:
             errors.append("target_column obrigatoria para describe_column")
         elif target_column not in profile_map:
             errors.append(f"target_column desconhecida: {target_column}")
+
+    if intent in {"catalog_lookup_by_id", "catalog_lookup_by_title", "catalog_record_summary", "catalog_compare"}:
+        if not (plan.get("filters") or []):
+            errors.append("filtros obrigatorios para lookup/catalogo")
+
+    if intent == "catalog_field_lookup":
+        if not target_column:
+            errors.append("target_column obrigatoria para catalog_field_lookup")
+        elif target_column not in profile_map:
+            errors.append(f"target_column desconhecida: {target_column}")
+        if not (plan.get("filters") or []):
+            errors.append("filtros obrigatorios para catalog_field_lookup")
 
     for flt in plan.get("filters", []) or []:
         column = flt.get("column")

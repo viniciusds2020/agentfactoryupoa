@@ -170,6 +170,21 @@ button {
   font-size: 11px;
 }
 
+.bubble-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(46, 230, 166, 0.28);
+  background: rgba(46, 230, 166, 0.10);
+  color: #8df3cf;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
 .view-tabs-wrap {
   padding: 0 22px 10px;
   flex-shrink: 0;

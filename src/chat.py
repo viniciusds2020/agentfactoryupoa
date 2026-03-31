@@ -1,4 +1,4 @@
-﻿"""Semantic retrieval (vector search) and RAG generation."""
+"""Semantic retrieval (vector search) and RAG generation."""
 from __future__ import annotations
 
 import re
@@ -13,7 +13,13 @@ from src.config import get_settings
 from src.guardrails import detect_injection, sanitize_context_chunk, sanitize_history, sanitize_question
 from src.lexical import normalize_query_numerals
 from src.observability import metrics
-from src.prompts import build_rag_messages, format_context, get_rag_system
+from src.prompts import (
+    build_catalog_record_messages,
+    build_rag_messages,
+    format_context,
+    get_catalog_record_system,
+    get_rag_system,
+)
 from src.table_renderer import render_table_answer
 from src.table_semantics import aggregation_lead_text, infer_subject_label, render_value_by_unit
 from src.utils import get_logger, log_event
@@ -21,7 +27,7 @@ from src.utils import get_logger, log_event
 logger = get_logger(__name__)
 
 
-# â”€â”€ Context budget management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Context budget management ────────────────────────────────────────────────
 
 def _estimate_tokens(text: str, chars_per_token: float = 3.5) -> int:
     """Estimate token count from character length (conservative for PT-BR)."""
@@ -64,7 +70,7 @@ def _trim_to_budget(
     return result
 
 
-# â”€â”€ Data classes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Data classes ─────────────────────────────────────────────────────────────
 
 @dataclass
 class ChatMessage:
@@ -143,8 +149,14 @@ _CHAPTER_REF_RE = re.compile(r"\bcapitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECA
 _TITLE_REF_RE = re.compile(r"\btitulo\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
 _SECTION_REF_RE = re.compile(r"\bsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
 _SUBSECTION_REF_RE = re.compile(r"\bsubsecao\s+([ivxlcdm]+|\d{1,4})\b", re.IGNORECASE)
-_ARTICLE_REF_RE = re.compile(r"\bart(?:igo)?\.?\s*([0-9]{1,4})(?:[º°o])?\b", re.IGNORECASE)
-_ARTICLE_BLOCK_RE = re.compile(r"\bArt\.?\s*(\d{1,4})(?:[º°o])?\b", re.IGNORECASE)
+_ARTICLE_REF_RE = re.compile(
+    r"\bart(?:igo)?\.?\s*([0-9]{1,4})(?:\s*(?:º|°|o|Âº|Â°|ª))?",
+    re.IGNORECASE,
+)
+_ARTICLE_BLOCK_RE = re.compile(
+    r"\bArt\.?\s*(\d{1,4})(?:\s*(?:º|°|o|Âº|Â°|ª))?",
+    re.IGNORECASE,
+)
 
 _NODE_META_KEYS: dict[str, tuple[str, ...]] = {
     "titulo": ("titulo", "title"),
@@ -204,7 +216,7 @@ def _extract_chapter_refs_from_text(text: str) -> set[str]:
 def _expand_refs_arabic_roman(refs: set[str]) -> set[str]:
     """Expand chapter refs to include both Arabic and Roman numeral forms.
 
-    E.g., {"2"} â†’ {"2", "ii"}, {"ii"} â†’ {"ii", "2"}, {"iv"} â†’ {"iv", "4"}
+    E.g., {"2"} → {"2", "ii"}, {"ii"} → {"ii", "2"}, {"iv"} → {"iv", "4"}
     """
     from src.lexical import int_to_roman, roman_to_int
     expanded = set(refs)
@@ -267,7 +279,7 @@ def _item_matches_structural_target(item: dict, node_type: str, refs: set[str]) 
         if meta_refs & expanded_refs:
             return True
         # Robust fallback: some OCR/parsing variants may corrupt labels
-        # (e.g., "CAPÃTULO"), but numerals still survive.
+        # (e.g., "CAPÍTULO"), but numerals still survive.
         generic_num_tokens = set(
             re.findall(r"\b(?:[ivxlcdm]+|\d{1,4})\b", _normalize_for_match(value))
         )
@@ -667,7 +679,7 @@ def _mark_possible_contradiction(answer_text: str, results: list[dict], question
     return answer_text + note
 
 
-# â”€â”€ Legal parent expansion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Legal parent expansion ───────────────────────────────────────────────────
 
 def _expand_legal_context(
     results: list[dict],
@@ -712,7 +724,7 @@ def _expand_legal_context(
     return expanded
 
 
-# â”€â”€ Query expansion & HyDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Query expansion & HyDE ───────────────────────────────────────────────────
 
 def _expand_query_llm(
     question: str,
@@ -764,7 +776,7 @@ def _generate_hypothetical_doc(
         return question
 
 
-# â”€â”€ Semantic retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Semantic retrieval ────────────────────────────────────────────────────────
 
 def _deduplicate_hits(hits: list[dict]) -> list[dict]:
     """Deduplicate vector results by ID, keeping the highest-scored entry."""
@@ -794,7 +806,7 @@ def _vector_retrieve(
     """
     fetch_k = top_k * 3
 
-    # â”€â”€ Determine queries to run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Determine queries to run ─────────────────────────────────────────
     queries = [question]
     if getattr(settings, "query_expansion_enabled", False):
         with metrics.time_block("chat.query_expansion"):
@@ -802,7 +814,7 @@ def _vector_retrieve(
 
     search_query = normalize_query_numerals(question)
 
-    # â”€â”€ Vector search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Vector search ────────────────────────────────────────────────────
     all_hits: list[dict] = []
     if getattr(settings, "hyde_enabled", False):
         with metrics.time_block("chat.hyde_generation"):
@@ -830,12 +842,12 @@ def _vector_retrieve(
                     vectordb.query(physical_collection, [q_vec], n_results=fetch_k, where=where)
                 )
 
-    # â”€â”€ Convert distance â†’ score (cosine distance 0-2 â†’ score 0-1) â”€â”€â”€â”€â”€
+    # ── Convert distance → score (cosine distance 0-2 → score 0-1) ─────
     for hit in all_hits:
         if "score" not in hit and "distance" in hit:
             hit["score"] = max(0.0, 1.0 - hit["distance"])
 
-    # â”€â”€ Deduplicate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Deduplicate ──────────────────────────────────────────────────────
     results = _deduplicate_hits(all_hits)
 
     log_event(
@@ -848,7 +860,7 @@ def _vector_retrieve(
         request_id=request_id,
     )
 
-    # â”€â”€ Cross-encoder reranking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Cross-encoder reranking ──────────────────────────────────────────
     if getattr(settings, "reranker_enabled", False):
         from src.reranker import rerank as ce_rerank
 
@@ -866,7 +878,7 @@ def _vector_retrieve(
             top_k=reranker_top,
         )
 
-    # â”€â”€ Structural reranking + threshold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Structural reranking + threshold ─────────────────────────────────
     results = _rerank_structural_continuity(
         results,
         question=question,
@@ -979,6 +991,14 @@ def _build_table_query_summary(plan: dict) -> str:
         return "SHOW COLUMNS FROM tabela"
     if op == "describe_column":
         return f"DESCRIBE COLUMN {str(plan.get('target_column') or '').strip()}"
+    if op == "catalog_lookup":
+        return "LOOKUP registro por identificador ou descricao"
+    if op == "catalog_field_lookup":
+        return f"LOOKUP campo {str(plan.get('target_column') or '').strip()} em registro de catalogo"
+    if op == "catalog_record_summary":
+        return "SUMMARY de registro de catalogo"
+    if op == "catalog_compare":
+        return "COMPARE registros de catalogo"
     return "Consulta analitica estruturada"
 
 
@@ -1035,6 +1055,28 @@ def _table_result_preview(result: dict, plan: dict) -> str:
             ", ".join(f"{key}={value}" for key, value in row.items())
             for row in rows
         ) or "resultado: sem comparacao"
+    if result.get("operation") in {"catalog_lookup", "catalog_field_lookup", "catalog_record_summary"}:
+        record = result.get("record") or {}
+        if not record:
+            return "registro nao encontrado"
+        interesting = [
+            "procedimento",
+            "codigo",
+            "descricao_unimed_poa",
+            "descricao",
+            "cobertura_unimed_poa",
+            "cobertura",
+            "prazo_autorizacao_conforme_rn_n_623_ans",
+            "orientacao_autorizacao_call_center",
+        ]
+        preview_parts = [f"{key}={record.get(key)}" for key in interesting if key in record and str(record.get(key, "")).strip()]
+        return "; ".join(preview_parts[:6]) or "registro localizado"
+    if result.get("operation") == "catalog_compare":
+        rows = result.get("rows", [])[:3]
+        return "; ".join(
+            ", ".join(f"{key}={value}" for key, value in row.items() if str(value).strip())
+            for row in rows
+        ) or "comparacao de catalogo sem resultado"
     rows = result.get("rows", [])[:5]
     if not rows:
         return "resultado: sem linhas"
@@ -1111,6 +1153,10 @@ def _answer_table_first(
     metrics.increment("chat.table_first.hit")
     if plan.get("validated", False):
         metrics.increment("chat.table_first.validated")
+    operation = str(plan.get("operation") or "")
+    citation_label = "consulta analitica executada"
+    if operation.startswith("catalog_"):
+        citation_label = "registro de catalogo"
     return ChatResult(
         answer=answer,
         sources=[
@@ -1126,7 +1172,7 @@ def _answer_table_first(
                     "result": result,
                     "query_summary": _build_table_query_summary({**plan, "sql_generated": result.get("sql_generated", "")}),
                     "result_preview": _table_result_preview(result, plan),
-                    "citation_label": "consulta analitica executada",
+                    "citation_label": citation_label,
                     "context_hint": context_hint,
                 },
             )
@@ -1213,28 +1259,28 @@ def _retrieve_with_routing(
     return _merge_structured_vector(structured_results, vector_results, top_k=top_k)
 
 
-# â”€â”€ Query intent classification (Gap 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Query intent classification (Gap 4) ─────────────────────────────────────
 
 class QueryIntent(Enum):
     COUNT_STRUCTURAL = "count_structural"  # "quantos capitulos tem?"
     LIST_STRUCTURAL = "list_structural"  # "quais secoes existem no capitulo v?"
     LOCATE_STRUCTURAL = "locate_structural"  # "qual e o ultimo capitulo?"
     CONTAINS_STRUCTURAL = "contains_structural"  # "o capitulo v tem secao iii?"
-    SUMMARY_STRUCTURAL = "summary_structural"  # "resuma o capÃ­tulo 2"
-    QUESTION_STRUCTURAL = "question_structural"  # "o que diz o capÃ­tulo 2?"
-    QUESTION_FACTUAL = "question_factual"  # "Ã© proibido remunerar?"
+    SUMMARY_STRUCTURAL = "summary_structural"  # "resuma o capítulo 2"
+    QUESTION_STRUCTURAL = "question_structural"  # "o que diz o capítulo 2?"
+    QUESTION_FACTUAL = "question_factual"  # "é proibido remunerar?"
     LOCATE_EXCERPT = "locate_excerpt"  # "art. 41"
-    COMPARISON = "comparison"  # "compare capÃ­tulo 1 e 2"
+    COMPARISON = "comparison"  # "compare capítulo 1 e 2"
 
 _SUMMARY_PATTERNS = [
-    re.compile(r"\b(?:resum[aeiou]|sintetiz[ae]|expliq[ue]|descrev[ae]|vis[aÃ£]o\s+(?:geral|executiva))\b", re.IGNORECASE),
+    re.compile(r"\b(?:resum[aeiou]|sintetiz[ae]|expliq[ue]|descrev[ae]|vis[aã]o\s+(?:geral|executiva))\b", re.IGNORECASE),
 ]
 _STRUCTURAL_REF_PATTERNS = [
-    re.compile(r"\b(?:cap[iÃ­]tulo|se[cÃ§][aÃ£]o|t[iÃ­]tulo|parte)\s+[IVXLCDM\d]+", re.IGNORECASE),
+    re.compile(r"\b(?:cap[ií]tulo|se[cç][aã]o|t[ií]tulo|parte)\s+[IVXLCDM\d]+", re.IGNORECASE),
 ]
 _COMPARISON_PATTERNS = [
     re.compile(r"\bcompar[ae]\b", re.IGNORECASE),
-    re.compile(r"\bdiferenÃ§a\s+entre\b", re.IGNORECASE),
+    re.compile(r"\bdiferença\s+entre\b", re.IGNORECASE),
     re.compile(r"\bversus\b|\bvs\.?\b", re.IGNORECASE),
 ]
 
@@ -1303,9 +1349,9 @@ def _classify_intent_regex(question: str) -> QueryIntent:
     return QueryIntent.QUESTION_FACTUAL
 
 
-# â”€â”€ Embeddings-based intent classifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Embeddings-based intent classifier ─────────────────────────────────────
 
-# Exemplar queries per intent â€” used as few-shot anchors for similarity
+# Exemplar queries per intent — used as few-shot anchors for similarity
 _INTENT_EXEMPLARS: dict[QueryIntent, list[str]] = {
     QueryIntent.COUNT_STRUCTURAL: [
         "Quantos capitulos tem no estatuto?",
@@ -1328,34 +1374,34 @@ _INTENT_EXEMPLARS: dict[QueryIntent, list[str]] = {
         "O titulo I contem capitulo II?",
     ],
     QueryIntent.SUMMARY_STRUCTURAL: [
-        "Resuma o capÃ­tulo II",
-        "Sintetize a seÃ§Ã£o III",
-        "VisÃ£o geral do tÃ­tulo I",
-        "Explique o capÃ­tulo 3 em linguagem simples",
-        "FaÃ§a um resumo executivo do capÃ­tulo IV",
+        "Resuma o capítulo II",
+        "Sintetize a seção III",
+        "Visão geral do título I",
+        "Explique o capítulo 3 em linguagem simples",
+        "Faça um resumo executivo do capítulo IV",
     ],
     QueryIntent.QUESTION_STRUCTURAL: [
-        "O que diz o capÃ­tulo II sobre obrigaÃ§Ãµes?",
-        "Quais sÃ£o os direitos previstos na seÃ§Ã£o I?",
-        "O capÃ­tulo 5 trata de quÃª?",
-        "Que artigos estÃ£o no tÃ­tulo III?",
+        "O que diz o capítulo II sobre obrigações?",
+        "Quais são os direitos previstos na seção I?",
+        "O capítulo 5 trata de quê?",
+        "Que artigos estão no título III?",
     ],
     QueryIntent.QUESTION_FACTUAL: [
-        "Qual o prazo para pagamento de rescisÃ£o?",
-        "Ã‰ proibido remunerar diretores?",
+        "Qual o prazo para pagamento de rescisão?",
+        "É proibido remunerar diretores?",
         "Quantos membros tem o conselho?",
-        "Qual Ã© o quÃ³rum de deliberaÃ§Ã£o?",
+        "Qual é o quórum de deliberação?",
     ],
     QueryIntent.LOCATE_EXCERPT: [
         "Art. 41",
         "Artigo 15",
-        "CapÃ­tulo II",
-        "SeÃ§Ã£o III",
+        "Capítulo II",
+        "Seção III",
     ],
     QueryIntent.COMPARISON: [
-        "Compare o capÃ­tulo 1 e o capÃ­tulo 2",
-        "Qual a diferenÃ§a entre a seÃ§Ã£o I e a seÃ§Ã£o II?",
-        "CapÃ­tulo III versus capÃ­tulo IV",
+        "Compare o capítulo 1 e o capítulo 2",
+        "Qual a diferença entre a seção I e a seção II?",
+        "Capítulo III versus capítulo IV",
     ],
 }
 
@@ -1579,6 +1625,508 @@ def _resolve_processed_json(doc_id: str, filename: str) -> Path | None:
         path = artifacts_dir / f"{key}.json"
         if path.exists():
             return path
+    return None
+
+
+def _extract_catalog_code(question: str) -> str:
+    match = re.search(r"\b(\d{5,})\b", question or "")
+    return match.group(1) if match else ""
+
+
+def _catalog_field_request(question: str, workspace_id: str, collection: str) -> tuple[str, str, str] | None:
+    q_norm = _normalize_for_match(question)
+    semantic_priority = ["deadline_rule", "authorization_rule", "coverage_rule", "catalog_title"]
+    semantic_patterns = {
+        "deadline_rule": [
+            r"\bprazo\b",
+            r"\bprazo\s+de\s+autoriz",
+            r"\bprazo\s+autoriz",
+            r"\btempo\b",
+        ],
+        "authorization_rule": [
+            r"\bautoriz",
+            r"\bliberac",
+        ],
+        "coverage_rule": [
+            r"\bcobertura\b",
+            r"\bcobre\b",
+        ],
+        "catalog_title": [
+            r"\bdescri",
+            r"\bnome\b",
+            r"\btitulo\b",
+            r"\bprocedimento\b",
+        ],
+    }
+    fallback_tokens = {
+        "coverage_rule": ("cobertura", "cobertura", "cobertura"),
+        "authorization_rule": ("autorizacao", "autorizacao", "autorizacao"),
+        "deadline_rule": ("prazo", "prazo", "prazo de autorizacao"),
+        "catalog_title": ("descricao", "descricao", "descricao do procedimento"),
+    }
+    try:
+        from src import controlplane
+
+        profiles = controlplane.list_column_profiles(workspace_id, collection)
+    except Exception:
+        profiles = []
+
+    allowed_semantics = {"coverage_rule", "authorization_rule", "deadline_rule", "catalog_title"}
+    candidates: list[tuple[int, int, str, str, str]] = []
+    for profile in profiles:
+        semantic_type = str(profile.get("semantic_type", "")).strip()
+        if semantic_type not in allowed_semantics:
+            continue
+        aliases = [str(alias).strip().lower() for alias in profile.get("aliases_json", "").split("||") if str(alias).strip()]
+        aliases.extend(str(alias).strip().lower() for alias in profile.get("aliases", []) if str(alias).strip())
+        name = str(profile.get("column_name") or profile.get("name") or "").strip()
+        if not name:
+            continue
+        score = 0
+        for pattern in semantic_patterns.get(semantic_type, []):
+            if re.search(pattern, q_norm):
+                score += 10
+        for alias in aliases:
+            if alias and re.search(rf"\b{re.escape(alias)}\b", q_norm):
+                score += max(3, min(len(alias.split()), 4))
+        if score <= 0:
+            continue
+        label = aliases[0] if aliases else name.replace("_", " ")
+        priority = semantic_priority.index(semantic_type)
+        candidates.append((score, -priority, name, semantic_type, label))
+
+    if candidates:
+        candidates.sort(reverse=True)
+        _, _, name, semantic_type, label = candidates[0]
+        return name, semantic_type, label
+
+    for semantic_type in semantic_priority:
+        token, column_name, label = fallback_tokens[semantic_type]
+        if re.search(rf"\b{re.escape(token)}\b", q_norm):
+            return column_name, semantic_type, label
+    return None
+
+
+def _catalog_profiles(workspace_id: str, collection: str) -> list[dict]:
+    try:
+        from src import controlplane
+
+        raw_profiles = controlplane.list_column_profiles(workspace_id, collection)
+    except Exception:
+        return []
+
+    normalized: list[dict] = []
+    for profile in raw_profiles:
+        aliases = profile.get("aliases")
+        if aliases is None:
+            aliases_json = str(profile.get("aliases_json", "")).strip()
+            if aliases_json.startswith("["):
+                try:
+                    aliases = json.loads(aliases_json)
+                except Exception:
+                    aliases = []
+            else:
+                aliases = []
+        normalized.append(
+            {
+                "name": str(profile.get("column_name") or profile.get("name") or "").strip(),
+                "display_name": str(profile.get("display_name") or profile.get("column_name") or profile.get("name") or "").strip(),
+                "semantic_type": str(profile.get("semantic_type", "")).strip(),
+                "role": str(profile.get("role", "")).strip(),
+                "aliases": [str(alias).strip().lower() for alias in aliases or [] if str(alias).strip()],
+            }
+        )
+    return [profile for profile in normalized if profile.get("name")]
+
+
+def _catalog_header_order(blocks: list[dict], start_idx: int, profiles: list[dict]) -> list[dict]:
+    if not profiles:
+        return []
+    search_start = max(0, start_idx - 120)
+    best_matches: list[tuple[int, dict]] = []
+    best_key: tuple[int, int] | None = None
+    for idx in range(search_start, start_idx + 1):
+        text_parts: list[str] = []
+        consumed = 0
+        probe = idx
+        while probe <= start_idx and consumed < 5:
+            raw = str(blocks[probe].get("text", "")).strip()
+            if not raw:
+                probe += 1
+                consumed += 1
+                continue
+            if probe > idx and _looks_like_catalog_record_start(raw):
+                break
+            text_parts.append(raw.replace("\n", " "))
+            probe += 1
+            consumed += 1
+        text = _normalize_for_match(" ".join(text_parts))
+        local_matches: list[tuple[int, dict]] = []
+        for profile in profiles:
+            best_pos = None
+            for alias in profile.get("aliases", []) or []:
+                if not alias:
+                    continue
+                pos = text.find(_normalize_for_match(alias))
+                if pos >= 0 and (best_pos is None or pos < best_pos):
+                    best_pos = pos
+            if best_pos is not None:
+                local_matches.append((best_pos, profile))
+        candidate_key = (len(local_matches), idx)
+        if local_matches and (
+            best_key is None
+            or candidate_key[0] > best_key[0]
+            or (candidate_key[0] == best_key[0] and candidate_key[1] > best_key[1])
+        ):
+            best_matches = sorted(local_matches, key=lambda item: item[0])
+            best_key = candidate_key
+    return [profile for _, profile in best_matches]
+
+
+def _looks_like_catalog_record_start(text: str) -> bool:
+    return bool(re.match(r"^\s*(?:[A-Z]{0,4}[-_/]?)?\d{5,}\b", text or ""))
+
+
+def _split_non_empty_lines(text: str) -> list[str]:
+    return [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
+
+
+def _catalog_block_is_headerish(text: str, profiles: list[dict]) -> bool:
+    normalized = _normalize_for_match(str(text or "").replace("\n", " "))
+    if not normalized:
+        return False
+    hits = 0
+    seen: set[str] = set()
+    for profile in profiles:
+        name = str(profile.get("name", "")).strip()
+        for alias in profile.get("aliases", []) or []:
+            alias_norm = _normalize_for_match(alias)
+            if alias_norm and alias_norm in normalized:
+                if name and name not in seen:
+                    seen.add(name)
+                    hits += 1
+                break
+    return hits >= 3
+
+
+def _catalog_record_end_index(blocks: list[dict], start_idx: int) -> int:
+    idx = start_idx + 1
+    while idx < len(blocks):
+        raw_text = str(blocks[idx].get("text", "")).strip()
+        if raw_text and _looks_like_catalog_record_start(raw_text):
+            return idx
+        idx += 1
+    return len(blocks)
+
+
+def _extract_catalog_record_from_blocks(blocks: list[dict], start_idx: int, code: str, profiles: list[dict] | None = None) -> dict[str, str]:
+    profiles = profiles or []
+    identifier_profile = next((profile for profile in profiles if profile.get("role") == "identifier"), None)
+    title_profile = next((profile for profile in profiles if profile.get("semantic_type") == "catalog_title"), None)
+    auth_profile = next((profile for profile in profiles if profile.get("semantic_type") == "authorization_rule"), None)
+    identifier_key = str(identifier_profile.get("name") if identifier_profile else "procedimento")
+    title_key = str(title_profile.get("name") if title_profile else "descricao_unimed_poa")
+    auth_key = str(
+        auth_profile.get("name") if auth_profile else "orientacao_autorizacao_call_center"
+    )
+    record: dict[str, str] = {identifier_key: code}
+    description_parts: list[str] = []
+    field_lines: list[str] = []
+    last_bucket = ""
+    end_idx = _catalog_record_end_index(blocks, start_idx)
+    start_text = str(blocks[start_idx].get("text", "")).strip()
+    if start_text:
+        trimmed_start = re.sub(rf"^\s*{re.escape(code)}\s*", "", start_text).strip(" -:/|")
+        if trimmed_start:
+            description_parts.append(trimmed_start)
+
+    idx = start_idx + 1
+    while idx < end_idx:
+        raw_text = str(blocks[idx].get("text", "")).strip()
+        if not raw_text:
+            idx += 1
+            continue
+        if _catalog_block_is_headerish(raw_text, profiles):
+            idx += 1
+            continue
+
+        lines = _split_non_empty_lines(raw_text)
+        joined = " ".join(lines)
+        lower_joined = _normalize_for_match(joined)
+
+        if "autoriz" in lower_joined:
+            field_lines.extend(lines)
+            last_bucket = "auth"
+        elif (
+            len(lines) >= 3
+            or any(token in lower_joined for token in ("sem cobertura", "hospitalar", "ambulatorial", "regulamentados", "nao", "sim", "uteis", "imediato"))
+        ):
+            field_lines.extend(lines)
+            last_bucket = "field"
+        elif last_bucket == "auth" and len(lines) <= 2:
+            field_lines.extend(lines)
+        else:
+            description_parts.append(joined)
+            last_bucket = "desc"
+        idx += 1
+
+    if description_parts:
+        record[title_key] = re.sub(r"\s+", " ", " ".join(description_parts)).strip()
+
+    normalized_lines = [re.sub(r"\s+", " ", line).strip() for line in field_lines if re.sub(r"\s+", " ", line).strip()]
+    first_auth_idx = next(
+        (i for i, line in enumerate(normalized_lines) if "autoriz" in _normalize_for_match(line)),
+        -1,
+    )
+    if first_auth_idx >= 0:
+        auth_lines = normalized_lines[first_auth_idx:]
+        non_auth_lines = normalized_lines[:first_auth_idx]
+    else:
+        auth_lines = []
+        non_auth_lines = normalized_lines
+
+    if len(non_auth_lines) >= 5:
+        first = _normalize_for_match(non_auth_lines[0])
+        second = _normalize_for_match(non_auth_lines[1])
+        coverage_tokens = ("hospitalar", "ambulatorial", "sem cobertura")
+        emergency_tokens = {"nao", "n�o", "sim"}
+        if (
+            not any(token in first for token in coverage_tokens)
+            and not any(token in second for token in coverage_tokens)
+            and first not in emergency_tokens
+            and second not in emergency_tokens
+        ):
+            non_auth_lines = [f"{non_auth_lines[0]} {non_auth_lines[1]}"] + non_auth_lines[2:]
+
+    ordered_profiles = _catalog_header_order(blocks, start_idx, profiles) or profiles
+    ordered_non_auth_profiles = [
+        profile for profile in ordered_profiles
+        if profile.get("role") != "identifier"
+        and profile.get("semantic_type") not in {"catalog_title", "authorization_rule"}
+    ]
+    if non_auth_lines and ordered_non_auth_profiles:
+        for idx, profile in enumerate(ordered_non_auth_profiles):
+            if idx >= len(non_auth_lines):
+                break
+            value = non_auth_lines[idx] if idx < len(ordered_non_auth_profiles) - 1 else " ".join(non_auth_lines[idx:])
+            record[str(profile.get("name"))] = value
+    elif non_auth_lines:
+        if len(non_auth_lines) >= 1:
+            record["segmentacao_ans"] = non_auth_lines[0]
+        if len(non_auth_lines) >= 2:
+            record["cobertura_unimed_poa"] = non_auth_lines[1]
+        if len(non_auth_lines) >= 3:
+            record["emergencia"] = non_auth_lines[2]
+        if len(non_auth_lines) >= 4:
+            record["prazo_autorizacao_conforme_rn_n_623_ans"] = " ".join(non_auth_lines[3:])
+
+    if auth_lines:
+        record[auth_key] = " ".join(auth_lines)
+
+    return record
+
+
+def _artifact_catalog_field_value(record: dict[str, str], semantic_type: str, fallback_column: str) -> tuple[str, str] | None:
+    candidates_by_semantic = {
+        "deadline_rule": ["prazo_autorizacao_conforme_rn_n_623_ans", "prazo_autorizacao", "prazo"],
+        "authorization_rule": ["orientacao_autorizacao_call_center", "orientacao_autorizacao", "autorizacao"],
+        "coverage_rule": ["cobertura_unimed_poa", "cobertura"],
+        "catalog_title": ["descricao_unimed_poa", "descricao", "titulo", "title"],
+    }
+    for key in candidates_by_semantic.get(semantic_type, []):
+        value = str(record.get(key, "")).strip()
+        if value:
+            return key, value
+    value = str(record.get(fallback_column, "")).strip()
+    if value:
+        return fallback_column, value
+    return None
+
+
+def _deterministic_catalog_field_answer(
+    *,
+    code: str,
+    title: str,
+    semantic_type: str,
+    label: str,
+    value: str,
+) -> str:
+    if semantic_type == "deadline_rule":
+        return f"O prazo de autorizacao do procedimento {code} ({title}) e: {value}."
+    if semantic_type == "authorization_rule":
+        return f"A orientacao de autorizacao do procedimento {code} ({title}) e: {value}."
+    if semantic_type == "coverage_rule":
+        return f"A cobertura do procedimento {code} ({title}) e: {value}."
+    return f"O campo {label} do procedimento {code} ({title}) e: {value}."
+
+
+def _catalog_prompt_answer_is_usable(
+    *,
+    answer: str,
+    code: str,
+    semantic_type: str,
+    value: str,
+) -> bool:
+    text = str(answer or "").strip()
+    if not text:
+        return False
+    normalized = _normalize_for_match(text)
+    value_norm = _normalize_for_match(value)
+    if normalized == value_norm:
+        return False
+    if code and code in text:
+        return True
+    required_tokens = {
+        "deadline_rule": ("prazo",),
+        "authorization_rule": ("autoriz",),
+        "coverage_rule": ("cobertura",),
+    }.get(semantic_type, ())
+    return any(token in normalized for token in required_tokens)
+
+
+def _answer_catalog_code_from_artifact(
+    *,
+    collection: str,
+    question: str,
+    request_id: str,
+    workspace_id: str,
+) -> ChatResult | None:
+    code = _extract_catalog_code(question)
+    if not code:
+        return None
+    try:
+        from src import controlplane
+    except Exception:
+        return None
+
+    documents = controlplane.list_documents(workspace_id, collection)
+    profiles = _catalog_profiles(workspace_id, collection)
+    requested_field = _catalog_field_request(question, workspace_id, collection)
+    for doc in documents:
+        artifact = _resolve_processed_json(doc.doc_id, doc.filename)
+        if not artifact:
+            continue
+        try:
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        blocks = payload.get("blocks", []) or []
+        texts = [str(block.get("text", "")).strip() for block in blocks if str(block.get("text", "")).strip()]
+        compact_blocks = [{"text": str(block.get("text", "")).strip()} for block in blocks if str(block.get("text", "")).strip()]
+        for idx, text in enumerate(texts):
+            if not re.search(rf"\b{re.escape(code)}\b", text):
+                continue
+            window = " ".join(part for part in texts[idx:idx + 3] if part).strip()
+            compact = re.sub(r"\s+", " ", window)
+            record = _extract_catalog_record_from_blocks(compact_blocks, idx, code, profiles=profiles)
+            description = ""
+            for candidate in [p.get("name") for p in profiles if p.get("semantic_type") == "catalog_title"] + ["descricao_unimed_poa", "descricao", "titulo", "title", "nome"]:
+                if not candidate:
+                    continue
+                description = str(record.get(str(candidate), "")).strip()
+                if description:
+                    break
+            if requested_field:
+                target_column, semantic_type, label = requested_field
+                field_value = _artifact_catalog_field_value(record, semantic_type, target_column)
+                if field_value:
+                    resolved_column, value = field_value
+                    title = description or f"codigo {code}"
+                    deterministic_answer = _deterministic_catalog_field_answer(
+                        code=code,
+                        title=title,
+                        semantic_type=semantic_type,
+                        label=label,
+                        value=value,
+                    )
+                    answer = deterministic_answer
+                    try:
+                        record_json = json.dumps(record, ensure_ascii=False, indent=2)
+                        prompt_messages = build_catalog_record_messages(
+                            question=question,
+                            target_column=resolved_column,
+                            field_label=label,
+                            record_json=record_json,
+                        )
+                        prompted_answer = llm.chat(
+                            prompt_messages,
+                            system=get_catalog_record_system(),
+                        ).strip()
+                        if _catalog_prompt_answer_is_usable(
+                            answer=prompted_answer,
+                            code=code,
+                            semantic_type=semantic_type,
+                            value=value,
+                        ):
+                            answer = prompted_answer
+                    except Exception:
+                        answer = deterministic_answer
+                    preview_parts: list[str] = []
+                    if description:
+                        preview_parts.append(description)
+                    preview_parts.append(str(value).strip())
+                    source_excerpt = re.sub(r"\s+", " ", " ".join(preview_parts)).strip() or compact[:400]
+                    log_event(
+                        logger,
+                        20,
+                        "Catalog field resolved from processed artifact using schema-aware fallback",
+                        request_id=request_id,
+                        collection=collection,
+                        doc_id=doc.doc_id,
+                        code=code,
+                        target_column=resolved_column,
+                        semantic_type=semantic_type,
+                    )
+                    return ChatResult(
+                        answer=answer,
+                        sources=[
+                            Source(
+                                chunk_id=f"artifact::{doc.doc_id}::{code}",
+                                doc_id=doc.doc_id,
+                                excerpt=source_excerpt[:400],
+                                score=1.0,
+                                metadata={
+                                    "source_filename": doc.filename,
+                                    "citation_label": "registro de catalogo (artefato prata)",
+                                    "source_kind": "artifact_lookup",
+                                    "artifact_record": record,
+                                    "artifact_profiles": profiles,
+                                    "target_column": resolved_column,
+                                },
+                            )
+                        ],
+                        request_id=request_id,
+                    )
+            answer = (
+                f"Encontrei o codigo {code} no artefato processado."
+                + (f" Trecho associado: {description}." if description else f" Contexto encontrado: {compact[:280]}.")
+            )
+            log_event(
+                logger,
+                20,
+                "Catalog code resolved from processed artifact",
+                request_id=request_id,
+                collection=collection,
+                doc_id=doc.doc_id,
+                code=code,
+            )
+            return ChatResult(
+                answer=answer,
+                sources=[
+                    Source(
+                        chunk_id=f"artifact::{doc.doc_id}::{code}",
+                        doc_id=doc.doc_id,
+                        excerpt=compact[:400],
+                        score=1.0,
+                        metadata={
+                            "source_filename": doc.filename,
+                            "citation_label": "registro de catalogo (artefato prata)",
+                            "source_kind": "artifact_lookup",
+                        },
+                    )
+                ],
+                request_id=request_id,
+            )
     return None
 
 
@@ -2299,7 +2847,7 @@ def _build_on_demand_summary_from_scope(
     return data
 
 
-# â”€â”€ Main answer function â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Main answer function ─────────────────────────────────────────────────────
 
 def answer(
     collection: str,
@@ -2317,7 +2865,7 @@ def answer(
     profile_name = domain_profile or settings.default_domain_profile
     physical_collection = vectordb.resolve_query_collection(collection, model_name, workspace_id=workspace_id)
 
-    # â”€â”€ Guardrails â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Guardrails ────────────────────────────────────────────────
     question = sanitize_question(question)
     history = sanitize_history(history or [])
 
@@ -2325,12 +2873,12 @@ def answer(
     if injection:
         log_event(logger, 30, "Prompt injection detected in question", pattern=injection, request_id=request_id)
         return ChatResult(
-            answer="NÃ£o foi possÃ­vel processar essa pergunta. Reformule sua solicitaÃ§Ã£o.",
+            answer="Não foi possível processar essa pergunta. Reformule sua solicitação.",
             sources=[],
             request_id=request_id,
         )
 
-    # â”€â”€ Intent classification + summary shortcut â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Intent classification + summary shortcut ──────────────────
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified", intent=intent.value, request_id=request_id)
     metrics.increment(f"chat.intent.{intent.value}")
@@ -2343,6 +2891,15 @@ def answer(
     )
     if table_result:
         return table_result
+
+    artifact_catalog_result = _answer_catalog_code_from_artifact(
+        collection=collection,
+        question=question,
+        request_id=request_id,
+        workspace_id=workspace_id,
+    )
+    if artifact_catalog_result:
+        return artifact_catalog_result
 
     if intent in {
         QueryIntent.COUNT_STRUCTURAL,
@@ -2432,7 +2989,7 @@ def answer(
             request_id=request_id,
         )
 
-    # â”€â”€ Retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Retrieval ─────────────────────────────────────────────────
     fused = _retrieve_with_routing(
         question=question,
         collection=collection,
@@ -2469,12 +3026,12 @@ def answer(
             request_id=request_id,
         )
         return ChatResult(
-            answer="NÃ£o encontrei informaÃ§Ãµes relevantes nos documentos disponÃ­veis para essa coleÃ§Ã£o.",
+            answer="Não encontrei informações relevantes nos documentos disponíveis para essa coleção.",
             sources=[],
             request_id=request_id,
         )
 
-    # â”€â”€ Parent expansion for legal chunks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Parent expansion for legal chunks ─────────────────────────
     max_exp = int(settings.max_context_tokens * 0.4)
     fused = _expand_legal_context(
         fused, physical_collection,
@@ -2555,7 +3112,7 @@ def answer(
                 model_name=model_name,
             )
 
-    # â”€â”€ Sanitize + compress + trim + format â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Sanitize + compress + trim + format ────────────────────────
     for item in fused:
         item["text"] = sanitize_context_chunk(item["text"])
 
@@ -2574,7 +3131,7 @@ def answer(
     context_tokens = _estimate_tokens(context, settings.chars_per_token)
     metrics.observe("chat.context_tokens", context_tokens)
 
-    # â”€â”€ LLM generation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── LLM generation ────────────────────────────────────────────
     messages: list[dict] = [{"role": msg.role, "content": msg.content} for msg in history]
     messages.extend(build_rag_messages(context=context, question=question))
 
@@ -2604,11 +3161,11 @@ def answer(
     return ChatResult(answer=answer_text, sources=sources, request_id=request_id)
 
 
-# â”€â”€ Streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Streaming ────────────────────────────────────────────────────────────────
 
 @dataclass
 class StreamContext:
-    """Holds retrieval results for streaming â€” sources are sent before the LLM tokens."""
+    """Holds retrieval results for streaming — sources are sent before the LLM tokens."""
     sources: list[Source]
     request_id: str
     messages: list[dict]
@@ -2638,12 +3195,12 @@ def prepare_stream(
     if injection:
         log_event(logger, 30, "Prompt injection detected in question", pattern=injection, request_id=request_id)
         return ChatResult(
-            answer="NÃ£o foi possÃ­vel processar essa pergunta. Reformule sua solicitaÃ§Ã£o.",
+            answer="Não foi possível processar essa pergunta. Reformule sua solicitação.",
             sources=[],
             request_id=request_id,
         )
 
-    # â”€â”€ Intent classification + summary shortcut for streaming â”€â”€â”€â”€
+    # ── Intent classification + summary shortcut for streaming ────
     intent = classify_query_intent(question)
     log_event(logger, 20, "Query intent classified",
               intent=intent.value, request_id=request_id)
@@ -2656,6 +3213,15 @@ def prepare_stream(
     )
     if table_result:
         return table_result
+
+    artifact_catalog_result = _answer_catalog_code_from_artifact(
+        collection=collection,
+        question=question,
+        request_id=request_id,
+        workspace_id=workspace_id,
+    )
+    if artifact_catalog_result:
+        return artifact_catalog_result
 
     if intent in {
         QueryIntent.COUNT_STRUCTURAL,
@@ -2777,7 +3343,7 @@ def prepare_stream(
 
     if not fused:
         return ChatResult(
-            answer="NÃ£o encontrei informaÃ§Ãµes relevantes nos documentos disponÃ­veis para essa coleÃ§Ã£o.",
+            answer="Não encontrei informações relevantes nos documentos disponíveis para essa coleção.",
             sources=[],
             request_id=request_id,
         )

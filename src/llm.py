@@ -45,21 +45,28 @@ def _load_st_model(model_name: str):  # type: ignore[return]
 
 def embed(texts: list[str], model_name: str | None = None) -> list[list[float]]:
     """Embed texts using the configured model or an explicit override."""
+    from src.observability import EMBEDDING_DURATION
+    from time import perf_counter
+
     settings = get_settings()
     model_name = model_name or settings.embedding_model
 
+    start = perf_counter()
     if model_name in _FASTEMBED_MODELS:
         model = _load_fastembed(model_name)
-        return [v.tolist() for v in model.embed(texts)]
+        result = [v.tolist() for v in model.embed(texts)]
+    else:
+        model = _load_st_model(model_name)
+        vectors = model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=settings.embedding_batch_size,
+        )
+        result = [v.tolist() for v in vectors]
 
-    model = _load_st_model(model_name)
-    vectors = model.encode(
-        texts,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-        batch_size=settings.embedding_batch_size,
-    )
-    return [v.tolist() for v in vectors]
+    EMBEDDING_DURATION.labels(model=model_name).observe(perf_counter() - start)
+    return result
 
 
 def embedding_dimension(model_name: str | None = None) -> int:
@@ -155,10 +162,19 @@ def _truncate_messages(messages: list[dict], max_chars: int = 18000) -> list[dic
 
 
 def chat(messages: list[dict], system: str = "") -> str:
+    from src.observability import LLM_CALLS_TOTAL, LLM_DURATION
+    from time import perf_counter
+
     settings = get_settings()
+    start = perf_counter()
     if settings.llm_provider == "groq":
-        return _chat_groq(messages, system, settings)
-    return _chat_anthropic(messages, system, settings)
+        result = _chat_groq(messages, system, settings)
+    else:
+        result = _chat_anthropic(messages, system, settings)
+
+    LLM_CALLS_TOTAL.labels(provider=settings.llm_provider, model=settings.llm_model).inc()
+    LLM_DURATION.labels(provider=settings.llm_provider).observe(perf_counter() - start)
+    return result
 
 
 def _chat_groq(messages: list[dict], system: str, settings) -> str:
