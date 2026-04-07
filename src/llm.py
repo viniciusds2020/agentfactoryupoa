@@ -10,12 +10,46 @@ Embeddings use two backends with automatic selection by model name:
 """
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from functools import lru_cache
 
 from src.config import get_settings
 from src.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+# ── Circuit Breaker ───────────────────────────────────────────────────────
+
+
+@dataclass
+class _CircuitBreaker:
+    """Simple circuit breaker for LLM providers."""
+    failure_count: int = 0
+    last_failure: float = 0.0
+    threshold: int = 3
+    reset_timeout: float = 60.0  # seconds
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure = time.time()
+
+    def record_success(self):
+        self.failure_count = 0
+
+    @property
+    def is_open(self) -> bool:
+        if self.failure_count < self.threshold:
+            return False
+        # Check if enough time has passed to try again (half-open)
+        if time.time() - self.last_failure > self.reset_timeout:
+            return False
+        return True
+
+
+_groq_breaker = _CircuitBreaker()
+_anthropic_breaker = _CircuitBreaker()
 
 _FASTEMBED_MODELS: set[str] = {
     "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
@@ -167,13 +201,60 @@ def chat(messages: list[dict], system: str = "") -> str:
 
     settings = get_settings()
     start = perf_counter()
-    if settings.llm_provider == "groq":
-        result = _chat_groq(messages, system, settings)
-    else:
-        result = _chat_anthropic(messages, system, settings)
 
-    LLM_CALLS_TOTAL.labels(provider=settings.llm_provider, model=settings.llm_model).inc()
-    LLM_DURATION.labels(provider=settings.llm_provider).observe(perf_counter() - start)
+    if settings.llm_provider == "groq":
+        if _groq_breaker.is_open:
+            logger.warning("Groq circuit breaker OPEN, routing to Anthropic")
+            try:
+                result = _chat_anthropic(messages, system, settings)
+                _anthropic_breaker.record_success()
+                provider_used = "anthropic"
+            except Exception:
+                _anthropic_breaker.record_failure()
+                raise
+        else:
+            try:
+                result = _chat_groq(messages, system, settings)
+                _groq_breaker.record_success()
+                provider_used = "groq"
+            except Exception as exc:
+                _groq_breaker.record_failure()
+                logger.warning(f"Groq failed ({exc}), trying Anthropic fallback")
+                try:
+                    result = _chat_anthropic(messages, system, settings)
+                    _anthropic_breaker.record_success()
+                    provider_used = "anthropic"
+                except Exception:
+                    _anthropic_breaker.record_failure()
+                    raise
+    else:
+        if _anthropic_breaker.is_open:
+            logger.warning("Anthropic circuit breaker OPEN, routing to Groq")
+            try:
+                result = _chat_groq(messages, system, settings)
+                _groq_breaker.record_success()
+                provider_used = "groq"
+            except Exception:
+                _groq_breaker.record_failure()
+                raise
+        else:
+            try:
+                result = _chat_anthropic(messages, system, settings)
+                _anthropic_breaker.record_success()
+                provider_used = "anthropic"
+            except Exception as exc:
+                _anthropic_breaker.record_failure()
+                logger.warning(f"Anthropic failed ({exc}), trying Groq fallback")
+                try:
+                    result = _chat_groq(messages, system, settings)
+                    _groq_breaker.record_success()
+                    provider_used = "groq"
+                except Exception:
+                    _groq_breaker.record_failure()
+                    raise
+
+    LLM_CALLS_TOTAL.labels(provider=provider_used, model=settings.llm_model).inc()
+    LLM_DURATION.labels(provider=provider_used).observe(perf_counter() - start)
     return result
 
 
@@ -249,10 +330,51 @@ def _chat_anthropic(messages: list[dict], system: str, settings) -> str:
 def chat_stream(messages: list[dict], system: str = ""):
     """Yield text chunks from the LLM as a generator (for SSE)."""
     settings = get_settings()
+
     if settings.llm_provider == "groq":
-        yield from _chat_stream_groq(messages, system, settings)
+        if _groq_breaker.is_open:
+            logger.warning("Groq circuit breaker OPEN, streaming via Anthropic")
+            try:
+                yield from _chat_stream_anthropic(messages, system, settings)
+                _anthropic_breaker.record_success()
+            except Exception:
+                _anthropic_breaker.record_failure()
+                raise
+        else:
+            try:
+                yield from _chat_stream_groq(messages, system, settings)
+                _groq_breaker.record_success()
+            except Exception as exc:
+                _groq_breaker.record_failure()
+                logger.warning(f"Groq stream failed ({exc}), trying Anthropic fallback")
+                try:
+                    yield from _chat_stream_anthropic(messages, system, settings)
+                    _anthropic_breaker.record_success()
+                except Exception:
+                    _anthropic_breaker.record_failure()
+                    raise
     else:
-        yield from _chat_stream_anthropic(messages, system, settings)
+        if _anthropic_breaker.is_open:
+            logger.warning("Anthropic circuit breaker OPEN, streaming via Groq")
+            try:
+                yield from _chat_stream_groq(messages, system, settings)
+                _groq_breaker.record_success()
+            except Exception:
+                _groq_breaker.record_failure()
+                raise
+        else:
+            try:
+                yield from _chat_stream_anthropic(messages, system, settings)
+                _anthropic_breaker.record_success()
+            except Exception as exc:
+                _anthropic_breaker.record_failure()
+                logger.warning(f"Anthropic stream failed ({exc}), trying Groq fallback")
+                try:
+                    yield from _chat_stream_groq(messages, system, settings)
+                    _groq_breaker.record_success()
+                except Exception:
+                    _groq_breaker.record_failure()
+                    raise
 
 
 def _chat_stream_groq(messages: list[dict], system: str, settings):

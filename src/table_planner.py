@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 class PlanFilter(BaseModel):
     column: str
-    operator: Literal["=", "!=", ">", "<", ">=", "<=", "in", "between"] = "="
+    operator: Literal["=", "!=", ">", "<", ">=", "<=", "in", "between", "like"] = "="
     value: str
 
 
@@ -35,6 +35,9 @@ class QueryPlan(BaseModel):
         "catalog_field_lookup",
         "catalog_record_summary",
         "catalog_compare",
+        "catalog_filter",
+        "catalog_deadline_report",
+        "catalog_sla_alert",
     ]
     subject: str = ""
     metric_column: str | None = None
@@ -68,6 +71,8 @@ def _catalog_field_profile(question: str, profiles: list[dict]):
         "autorizacao": "authorization_rule",
         "autoriza": "authorization_rule",
         "prazo": "deadline_rule",
+        "emergencia": "flag_boolean",
+        "urgencia": "flag_boolean",
     }
     for token, semantic_type in preferred_semantic.items():
         if token in q_norm:
@@ -84,6 +89,8 @@ def _extract_catalog_title_value(question: str) -> str:
         r"\bcodigo d[ao]s?\s+(.+?)\??$",
         r"\bqual e o codigo d[ao]s?\s+(.+?)\??$",
         r"\bqual o codigo d[ao]s?\s+(.+?)\??$",
+        r"\bo procedimento\s+(.+?)\s+(?:e cobert|tem cobertura|precisa de autoriz|requer autoriz)",
+        r"\bpara\s+(.+?)\??$",
     ]
     normalized = question.strip()
     for pattern in patterns:
@@ -103,6 +110,58 @@ def _catalog_plan(question: str, profiles: list[dict], filters: list[dict], cont
     field_profile = _catalog_field_profile(question, profiles)
     ids = _extract_catalog_ids(question)
     q_norm = normalize_semantic_text(question).replace("_", " ")
+
+    if re.search(r"\b(relatorio|resumo|agrupar|faixa)\b", q_norm) and "prazo" in q_norm:
+        return QueryPlan(
+            intent="catalog_deadline_report",
+            group_by=["prazo_faixa"],
+            aggregation="count",
+            filters=[PlanFilter(**item) for item in filters],
+            limit=5000,
+            confidence=0.95,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    if re.search(r"\b(alerta|alertas|sla|apertado|urgente|imediato)\b", q_norm):
+        local_filters = [PlanFilter(**item) for item in filters]
+        if "autoriz" in q_norm:
+            local_filters.append(PlanFilter(column="requer_autorizacao", operator="=", value="true"))
+        if re.search(r"\bimediato\b", q_norm):
+            local_filters.append(PlanFilter(column="prazo_urgencia", operator="=", value="imediato"))
+        else:
+            local_filters.append(PlanFilter(column="prazo_urgencia", operator="in", value="imediato|curto"))
+        return QueryPlan(
+            intent="catalog_sla_alert",
+            filters=local_filters,
+            limit=100,
+            confidence=0.9,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
+
+    deadline_metric = next((p for p in profiles if p.get("semantic_type") == "deadline_rule"), None)
+    if deadline_metric and re.search(r"\bprazo\b", q_norm) and re.search(r"\b(maior|menor|acima|abaixo|ate|até)\b", q_norm):
+        local_filters = [PlanFilter(**item) for item in filters]
+        m_gt = re.search(r"\b(?:maior(?:es)? que|mais de|acima de)\s+(\d+)\s+dias?\b", q_norm)
+        m_lt = re.search(r"\b(?:menor(?:es)? que|menos de|abaixo de)\s+(\d+)\s+dias?\b", q_norm)
+        m_lte = re.search(r"\b(?:ate|até)\s+(\d+)\s+dias?\b", q_norm)
+        if m_gt:
+            local_filters.append(PlanFilter(column="prazo_dias", operator=">", value=m_gt.group(1)))
+        elif m_lt:
+            local_filters.append(PlanFilter(column="prazo_dias", operator="<", value=m_lt.group(1)))
+        elif m_lte:
+            local_filters.append(PlanFilter(column="prazo_dias", operator="<=", value=m_lte.group(1)))
+        return QueryPlan(
+            intent="catalog_deadline_report",
+            group_by=["prazo_faixa"],
+            aggregation="count",
+            filters=local_filters,
+            limit=5000,
+            confidence=0.92,
+            planner_source="heuristic",
+            table_mode="catalog",
+        )
 
     if re.search(r"\b(compare|comparar|comparacao|versus|vs\.?)\b", q_norm) and len(ids) >= 2 and identifier:
         return QueryPlan(
@@ -153,6 +212,66 @@ def _catalog_plan(question: str, profiles: list[dict], filters: list[dict], cont
             planner_source="heuristic",
             table_mode="catalog",
         )
+
+    if re.search(r"\b(quais|liste|listar|mostre|mostrar)\b", q_norm):
+        local_filters = [PlanFilter(**item) for item in filters]
+        if re.search(r"\bemergencia\b|\burgencia\b", q_norm):
+            emergency = next((p for p in profiles if p.get("semantic_type") == "flag_boolean"), None)
+            if emergency:
+                local_filters.append(PlanFilter(column=emergency["name"], operator="=", value="SIM"))
+        elif re.search(r"\bautoriz", q_norm):
+            auth = next((p for p in profiles if p.get("semantic_type") == "authorization_rule"), None)
+            if auth:
+                local_filters.append(PlanFilter(column=auth["name"], operator="!=", value="nao necessita autorizacao"))
+        elif re.search(r"\bcobert", q_norm):
+            coverage = next((p for p in profiles if p.get("semantic_type") == "coverage_rule"), None)
+            if coverage:
+                local_filters.append(PlanFilter(column=coverage["name"], operator="!=", value="sem cobertura"))
+        if local_filters:
+            return QueryPlan(
+                intent="catalog_filter",
+                filters=local_filters,
+                limit=7,
+                confidence=0.9,
+                planner_source="heuristic",
+                table_mode="catalog",
+            )
+
+    if title:
+        fuzzy_title = _extract_catalog_title_value(question)
+        if not fuzzy_title:
+            patterns = [
+                r"\bprocedimento\s+(.+?)\s+(?:e\s+cobert|tem\s+cobertura|precisa|requer|e de emergencia|é de emergência)",
+                r"\bconsulta\s+(.+?)\b",
+                r"\bteleconsulta\s+(.+?)\b",
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, question, re.IGNORECASE)
+                if m:
+                    fuzzy_title = m.group(1).strip(" ?.").strip()
+                    break
+        if fuzzy_title:
+            local_filters = [PlanFilter(column=title["name"], operator="like", value=fuzzy_title)]
+            if field_profile and field_profile["name"] != title["name"]:
+                return QueryPlan(
+                    intent="catalog_field_lookup",
+                    target_column=field_profile["name"],
+                    filters=local_filters,
+                    limit=5,
+                    confidence=0.82,
+                    assumptions=["busca aproximada no titulo do catalogo"],
+                    planner_source="heuristic",
+                    table_mode="catalog",
+                )
+            return QueryPlan(
+                intent="catalog_filter",
+                filters=local_filters,
+                limit=7,
+                confidence=0.78,
+                assumptions=["busca aproximada no titulo do catalogo"],
+                planner_source="heuristic",
+                table_mode="catalog",
+            )
 
     return None
 

@@ -1,122 +1,36 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowDown, Download, Loader2, Menu, Paperclip, RefreshCw, Send, Trash2, Upload, X } from 'lucide-react'
+import { ArrowDown, Loader2, Menu, Send } from 'lucide-react'
 import { api } from './api'
+import {
+  inferSuggestedModeFromFile,
+  loadModeStateMap,
+  MODE_LABELS,
+  MODE_TO_CHAT_PROFILE,
+  MODE_TO_INGEST_PROFILE,
+  saveModeStateMap,
+} from './appModes'
 import type {
   CollectionSemanticProfile,
   CollectionInfo,
   Conversation,
+  DeadlineReport,
   DocumentArtifacts,
   DocumentRecord,
   IngestionJob,
   Message,
   TabularEvaluation,
 } from './api'
+import type { BaseMode, BaseModeState, SuggestedMode } from './appModes'
 import Sidebar from './components/Sidebar'
 import ChatMessage from './components/ChatMessage'
+import IngestionPanel from './components/IngestionPanel'
 import WelcomeScreen from './components/WelcomeScreen'
 
 const DEFAULT_EMBED = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024 // 2 GB
 const ALLOWED_EXTENSIONS = ['.pdf', '.docx', '.pptx', '.txt', '.md', '.xlsx', '.xls', '.csv']
-const MODE_STORAGE_KEY = 'kb-mode-locks-v1'
-
 type ViewTab = 'chat' | 'ingestion'
-type BaseMode = 'general' | 'legal' | 'tabular'
-type SuggestedMode = {
-  mode: BaseMode
-  subtype?: 'catalog' | 'analytic'
-  reason: string
-} | null
-
-type BaseModeState = {
-  mode: BaseMode
-  locked: boolean
-  locked_at?: string
-}
-
-const MODE_LABELS: Record<BaseMode, string> = {
-  general: 'Conversa Geral',
-  legal: 'Juridico/Contratos',
-  tabular: 'Planilhas/Tabelas',
-}
-
-const MODE_HELP: Record<BaseMode, string> = {
-  general: 'Bom para documentos corporativos, politicas e comunicados.',
-  legal: 'Prioriza estrutura juridica para contratos, estatutos e regras formais.',
-  tabular: 'Foco em tabelas, planilhas e dados estruturados.',
-}
-
-const MODE_TO_INGEST_PROFILE: Record<BaseMode, string> = {
-  general: 'general',
-  legal: 'legal',
-  tabular: 'tabular',
-}
-
-const MODE_TO_CHAT_PROFILE: Record<BaseMode, string> = {
-  general: 'general',
-  legal: 'legal',
-  tabular: 'tabular',
-}
-
-function loadModeStateMap(): Record<string, BaseModeState> {
-  if (typeof window === 'undefined') return {}
-  try {
-    const raw = window.localStorage.getItem(MODE_STORAGE_KEY)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as Record<string, BaseModeState>
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function saveModeStateMap(map: Record<string, BaseModeState>) {
-  if (typeof window === 'undefined') return
-  window.localStorage.setItem(MODE_STORAGE_KEY, JSON.stringify(map))
-}
-
-function stageLabel(status: string) {
-  if (status === 'queued') return 'Fila (Bronze)'
-  if (status === 'bronze_received') return 'Bronze recebido'
-  if (status === 'silver_processing') return 'Prata processando'
-  if (status === 'processing') return 'Processando'
-  if (status === 'indexed') return 'Ouro indexado'
-  if (status === 'failed') return 'Falhou'
-  return status
-}
-
-function stageProgress(status: string) {
-  if (status === 'queued') return 5
-  if (status === 'bronze_received') return 20
-  if (status === 'silver_processing') return 45
-  if (status === 'silver_extracted') return 65
-  if (status === 'gold_indexing') return 85
-  if (status === 'processing') return 80
-  if (status === 'indexed') return 100
-  if (status === 'failed') return 100
-  return 0
-}
-
-function inferSuggestedModeFromFile(file: File): SuggestedMode {
-  const name = file.name.toLowerCase()
-  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : ''
-  if (['.csv', '.xlsx', '.xls'].includes(ext)) {
-    const isCatalog = /(rol|procedimento|procedimentos|codigo|codigos|cobertura|autorizacao|tabela)/.test(name)
-    return {
-      mode: 'tabular',
-      subtype: isCatalog ? 'catalog' : 'analytic',
-      reason: isCatalog ? 'arquivo tabular com cara de catalogo/codigos' : 'arquivo tabular estruturado',
-    }
-  }
-  if (/(estatuto|contrato|regulamento|aditivo|juridic|clausula)/.test(name)) {
-    return { mode: 'legal', reason: 'nome do arquivo sugere conteudo juridico/contratual' }
-  }
-  if (/(procedimento|procedimentos|rol|codigo|cobertura|autorizacao|tabela)/.test(name)) {
-    return { mode: 'tabular', subtype: 'catalog', reason: 'arquivo sugere catalogo de codigos ou tabela operacional' }
-  }
-  return { mode: 'general', reason: 'documento narrativo/corporativo por padrao' }
-}
-
+type IngestionFocusTarget = 'pipeline' | 'jobs' | 'documents' | null
 export default function App() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
@@ -132,6 +46,7 @@ export default function App() {
   const [showScrollBtn, setShowScrollBtn] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [activeTab, setActiveTab] = useState<ViewTab>('chat')
+  const [ingestionFocusTarget, setIngestionFocusTarget] = useState<IngestionFocusTarget>(null)
 
   const [file, setFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -153,6 +68,7 @@ export default function App() {
   const [semanticLoading, setSemanticLoading] = useState(false)
   const [semanticError, setSemanticError] = useState<string | null>(null)
   const [tabularEval, setTabularEval] = useState<TabularEvaluation | null>(null)
+  const [deadlineReport, setDeadlineReport] = useState<DeadlineReport | null>(null)
   const [suggestedMode, setSuggestedMode] = useState<SuggestedMode>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -274,6 +190,7 @@ export default function App() {
     if (activeTab !== 'ingestion' || !collection || baseMode !== 'tabular') {
       setSemanticProfile(null)
       setSemanticError(null)
+      setDeadlineReport(null)
       return
     }
     let cancelled = false
@@ -281,17 +198,20 @@ export default function App() {
       setSemanticLoading(true)
       setSemanticError(null)
       try {
-        const [profile, evaluation] = await Promise.all([
+        const [profile, evaluation, deadline] = await Promise.all([
           api.getCollectionSemanticProfile(collection),
           api.getTabularEvaluation().catch(() => null),
+          api.getDeadlineReport(collection).catch(() => null),
         ])
         if (cancelled) return
         setSemanticProfile(profile)
         setTabularEval(evaluation)
+        setDeadlineReport(deadline)
       } catch (err) {
         if (cancelled) return
         setSemanticError(err instanceof Error ? err.message : 'Falha ao carregar semantica da base.')
         setSemanticProfile(null)
+        setDeadlineReport(null)
       } finally {
         if (!cancelled) setSemanticLoading(false)
       }
@@ -317,6 +237,140 @@ export default function App() {
       return bTs - aTs
     })
     .slice(0, 2)
+
+  const workspaceStatusLabel = (() => {
+    if (!collection) return 'Nenhuma base selecionada'
+    if (hasActiveJobs) return 'Processando documentos'
+    if (documents.some((doc) => doc.status === 'indexed')) return 'Base pronta para perguntas'
+    if (documents.length > 0) return 'Documentos carregados'
+    return 'Aguardando primeiro arquivo'
+  })()
+
+  const indexedDocumentsCount = documents.filter((doc) => doc.status === 'indexed').length
+  const latestActivityIso = [
+    ...documents.map((doc) => doc.updated_at || doc.created_at || ''),
+    ...jobs.map((job) => job.finished_at || job.started_at || job.created_at || ''),
+  ]
+    .filter(Boolean)
+    .sort()
+    .at(-1)
+
+  const latestActivityLabel = latestActivityIso
+    ? `atualizado em ${new Date(latestActivityIso).toLocaleString('pt-BR', {
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      })}`
+    : 'sem atividade recente'
+
+  const baseSummary = {
+    statusLabel: workspaceStatusLabel,
+    hint: !collection
+      ? 'Escolha uma base para iniciar o fluxo de ingestao e conversa.'
+      : hasActiveJobs
+        ? 'Sua base esta processando arquivos. Ja da para acompanhar o pipeline em tempo real.'
+        : indexedDocumentsCount > 0
+          ? 'A base esta pronta para responder com apoio dos documentos indexados.'
+          : documents.length > 0
+            ? 'Os arquivos foram recebidos, mas a indexacao ainda nao terminou.'
+            : 'A base existe, mas ainda nao recebeu o primeiro arquivo.',
+    docsCount: documents.length,
+    indexedCount: indexedDocumentsCount,
+    activeJobsCount: jobs.filter((job) =>
+      ['queued', 'bronze_received', 'silver_processing', 'silver_extracted', 'gold_indexing', 'processing'].includes(job.status),
+    ).length,
+    lastUpdatedLabel: latestActivityLabel,
+  }
+
+  const timelineSteps = (() => {
+    const docsCount = documents.length
+    const indexedCount = indexedDocumentsCount
+    const activeJobs = baseSummary.activeJobsCount
+    const bronzeDone = docsCount > 0
+    const silverDone = jobs.some((job) => ['silver_extracted', 'gold_indexing', 'indexed'].includes(job.status)) || indexedCount > 0
+    const goldDone = indexedCount > 0
+
+    return [
+      {
+        id: 'bronze',
+        label: 'Bronze',
+        meta: bronzeDone ? `${docsCount} arquivo(s) recebidos` : 'recebimento do arquivo bruto e metadados',
+        status: bronzeDone ? 'done' : activeJobs > 0 ? 'active' : 'idle',
+      },
+      {
+        id: 'silver',
+        label: 'Prata',
+        meta: silverDone
+          ? 'extracao e normalizacao concluidas'
+          : activeJobs > 0
+            ? 'extraindo e estruturando conteudo'
+            : 'aguardando processamento da camada prata',
+        status: silverDone ? 'done' : activeJobs > 0 && bronzeDone ? 'active' : 'idle',
+      },
+      {
+        id: 'gold',
+        label: 'Ouro',
+        meta: goldDone
+          ? `${indexedCount} documento(s) indexados`
+          : activeJobs > 0
+            ? 'gerando embeddings e indexando'
+            : 'aguardando indexacao vetorial',
+        status: goldDone ? 'done' : activeJobs > 0 && silverDone ? 'active' : 'idle',
+      },
+    ] as const
+  })()
+
+  const chatStatusBanner = (() => {
+    if (!collection) {
+      return {
+        tone: 'info',
+        title: 'Selecione uma base para conversar',
+        description: 'Escolha ou crie uma base de documentos antes de iniciar uma conversa.',
+        actionLabel: 'Ir para ingestao',
+        actionTab: 'ingestion' as const,
+        actionTarget: 'pipeline' as const,
+      }
+    }
+    if (hasActiveJobs) {
+      return {
+        tone: 'info',
+        title: 'Base em processamento',
+        description: 'Os documentos ainda estao passando pelas camadas Bronze, Prata e Ouro. Algumas respostas podem ficar incompletas ate a indexacao terminar.',
+        actionLabel: 'Acompanhar ingestao',
+        actionTab: 'ingestion' as const,
+        actionTarget: 'jobs' as const,
+      }
+    }
+    if (documents.length === 0) {
+      return {
+        tone: 'warning',
+        title: 'Base sem documentos',
+        description: 'Envie o primeiro arquivo para que a base possa responder com contexto.',
+        actionLabel: 'Enviar arquivo',
+        actionTab: 'ingestion' as const,
+        actionTarget: 'pipeline' as const,
+      }
+    }
+    if (indexedDocumentsCount === 0) {
+      return {
+        tone: 'warning',
+        title: 'Indexacao ainda nao concluida',
+        description: 'Os arquivos ja foram recebidos, mas o chat ainda depende da conclusao da indexacao.',
+        actionLabel: 'Ver pipeline',
+        actionTab: 'ingestion' as const,
+        actionTarget: 'pipeline' as const,
+      }
+    }
+    return {
+      tone: 'success',
+      title: 'Base pronta para responder',
+      description: `A conversa esta conectada a ${collection} com ${indexedDocumentsCount} documento(s) indexado(s).`,
+      actionLabel: '',
+      actionTab: 'chat' as const,
+      actionTarget: null,
+    }
+  })()
 
   useEffect(() => {
     if (activeTab !== 'ingestion') return
@@ -390,6 +444,7 @@ export default function App() {
 
   const handleUpload = async () => {
     if (!file) return
+    const targetCollection = collection || 'documentos'
     const validationError = validateFile(file)
     if (validationError) {
       setUploadMsg('err')
@@ -403,7 +458,7 @@ export default function App() {
       let asyncAccepted = false
       try {
         const job = await api.ingestDocumentAsync(
-          collection || 'documentos',
+          targetCollection,
           embedModel,
           file,
           effectiveIngestProfile,
@@ -420,14 +475,15 @@ export default function App() {
       }
 
       if (!asyncAccepted) {
-        await api.ingestDocument(collection || 'documentos', embedModel, file, effectiveIngestProfile, tableContext.trim())
+        await api.ingestDocument(targetCollection, embedModel, file, effectiveIngestProfile, tableContext.trim())
         setUploadMsg('ok')
         setUploadError('Documento processado e indexado com sucesso.')
         setTableContextDirty(false)
       }
 
-      if (collection) {
-        setModeStateForCollection(collection, {
+      if (targetCollection) {
+        setCollection(targetCollection)
+        setModeStateForCollection(targetCollection, {
           mode: baseMode,
           locked: true,
           locked_at: new Date().toISOString(),
@@ -437,8 +493,17 @@ export default function App() {
       setFile(null)
       setSuggestedMode(null)
       if (fileRef.current) fileRef.current.value = ''
-      await refreshCollections()
-      await refreshIngestionData()
+      const cols = await refreshCollections()
+      const match = cols.find((c) => c.collection === targetCollection)
+      if (match) {
+        setEmbedModel(match.embedding_model)
+      }
+      const docs = await api.listDocuments(targetCollection).catch(() => [])
+      setDocuments(docs)
+      if (jobsSupported) {
+        const data = await api.listIngestionJobs(40).catch(() => [])
+        setJobs(data)
+      }
       setSidebarKey((k) => k + 1)
     } catch (err) {
       setUploadMsg('err')
@@ -665,11 +730,19 @@ export default function App() {
       <Sidebar
         key={`${sidebarKey}-sidebar`}
         activeConvId={activeConv?.id ?? null}
+        activeTab={activeTab}
+        baseMode={baseMode}
         collection={collection}
         collections={collections}
+        documentsCount={documents.length}
+        indexedDocumentsCount={indexedDocumentsCount}
+        jobsSupported={jobsSupported}
+        activeJobsCount={baseSummary.activeJobsCount}
+        isModeLocked={isModeLocked}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((s) => !s)}
         onSelectConv={selectConv}
+        onSelectTab={setActiveTab}
         onNewConv={newConv}
         onCollectionChange={onCollectionChange}
       />
@@ -688,7 +761,8 @@ export default function App() {
         <div className="chat-layout">
           <div className="topbar">
             <div>
-              <div className="topbar-title">Agent Factory</div>
+              <div className="topbar-title">Workspace ativo</div>
+              <div className="topbar-subtitle">{workspaceStatusLabel}</div>
             </div>
             <div className="topbar-badges">
               {collection && <span className="top-badge">base: {collection}</span>}
@@ -744,8 +818,34 @@ export default function App() {
                 {error && <div className="error-banner">{error}</div>}
 
                 <div className="messages-inner">
+                  <div className={`chat-status-banner ${chatStatusBanner.tone}`}>
+                    <div className="chat-status-copy">
+                      <div className="chat-status-title">{chatStatusBanner.title}</div>
+                      <div className="chat-status-description">{chatStatusBanner.description}</div>
+                    </div>
+                    {chatStatusBanner.actionLabel && (
+                      <button
+                        type="button"
+                        className="chat-status-action"
+                        onClick={() => {
+                          setActiveTab(chatStatusBanner.actionTab)
+                          setIngestionFocusTarget(chatStatusBanner.actionTarget)
+                        }}
+                      >
+                        {chatStatusBanner.actionLabel}
+                      </button>
+                    )}
+                  </div>
+
                   {!hasMessages ? (
-                    <WelcomeScreen collection={collection || 'documentos'} />
+                    <WelcomeScreen
+                      collection={collection || 'documentos'}
+                      mode={baseMode}
+                      onSuggestionClick={(question) => {
+                        setInput(question)
+                        void send(question)
+                      }}
+                    />
                   ) : (
                     <>
                       {messages.map((msg, i) => (
@@ -787,17 +887,6 @@ export default function App() {
                     className="chat-input"
                   />
                   <button
-                    className="attach-btn"
-                    onClick={() => {
-                      setActiveTab('ingestion')
-                      fileRef.current?.click()
-                    }}
-                    aria-label="Ir para ingestao"
-                    title="Ir para ingestao"
-                  >
-                    <Paperclip size={16} />
-                  </button>
-                  <button
                     className="send-btn"
                     onClick={() => void send(input)}
                     disabled={!input.trim() || loading}
@@ -821,442 +910,50 @@ export default function App() {
               )}
             </>
           ) : (
-            <div className="messages-scroll">
-              <div className="messages-inner monitoring-stack">
-                <section className="ops-panel glass-panel ops-card ops-card-pipeline">
-                  <div className="ops-header">
-                    <div>
-                      <div className="ops-kicker">Pipeline</div>
-                      <div className="ops-title">Upload e Ingestao</div>
-                    </div>
-                    <button className="ops-refresh" onClick={() => void refreshIngestionData()}>
-                      <RefreshCw size={14} />
-                      atualizar
-                    </button>
-                  </div>
-
-                  <div className="ops-grid">
-                    <div className="ops-section">
-                      <div className="ops-section-head">
-                        <span>
-                          <Upload size={14} />
-                          Novo arquivo
-                        </span>
-                      </div>
-                      <div className="ops-list" style={{ marginBottom: 12 }}>
-                        <div className="ops-item">
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">Modo da Base</div>
-                            <div className="ops-item-meta">
-                              Escolha como esta base sera processada. Depois da primeira ingestao, fica fixo.
-                            </div>
-                            <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
-                              {(['general', 'legal', 'tabular'] as BaseMode[]).map((mode) => (
-                                <label
-                                  key={mode}
-                                  style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: isModeLocked ? 'not-allowed' : 'pointer' }}
-                                >
-                                  <input
-                                    type="radio"
-                                    name="base-mode"
-                                    checked={baseMode === mode}
-                                    onChange={() => onModeChange(mode)}
-                                    disabled={isModeLocked}
-                                  />
-                                  <span>
-                                    <strong>{MODE_LABELS[mode]}</strong>
-                                    <br />
-                                    <span className="ops-item-meta">{MODE_HELP[mode]}</span>
-                                  </span>
-                                </label>
-                              ))}
-                            </div>
-                            {isModeLocked && (
-                              <div className="ops-item-meta" style={{ marginTop: 8 }}>
-                                Modo fixo desta base. Para outro modo, crie uma nova base.
-                              </div>
-                            )}
-                            {!isModeLocked && suggestedMode && documents.length === 0 && (
-                              <div className="ops-item-meta" style={{ marginTop: 8 }}>
-                                Sugestao automatica: <strong>{MODE_LABELS[suggestedMode.mode]}</strong>
-                                {suggestedMode.subtype === 'catalog' ? ' • subtipo Catalogo/Codigos' : suggestedMode.subtype === 'analytic' ? ' • subtipo Analitico' : ''}
-                                {' '}({suggestedMode.reason}).
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                        {baseMode === 'tabular' && (
-                          <div className="ops-item">
-                            <div className="ops-item-main">
-                              <div className="ops-item-title">Contexto da Base</div>
-                              <div className="ops-item-meta">
-                                Descreva o que esta tabela representa e o significado das colunas principais. Isso melhora a interpretacao das perguntas.
-                              </div>
-                              <textarea
-                                value={tableContext}
-                                onChange={(e) => {
-                                  setTableContext(e.target.value)
-                                  setTableContextDirty(true)
-                                }}
-                                placeholder="Ex.: Cadastro de clientes com renda mensal, score de credito, cidade, estado e status do cadastro."
-                                rows={4}
-                                style={{
-                                  width: '100%',
-                                  marginTop: 10,
-                                  borderRadius: 12,
-                                  border: '1px solid rgba(76, 201, 240, 0.2)',
-                                  background: 'rgba(5, 12, 24, 0.72)',
-                                  color: 'inherit',
-                                  padding: '12px 14px',
-                                  resize: 'vertical',
-                                }}
-                              />
-                              {documents.length > 0 && (
-                                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
-                                  <button className="empty-upload-btn" onClick={() => void saveTableContext()} disabled={uploading || !tableContextDirty}>
-                                    salvar contexto
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                      {!file ? (
-                        <button className="empty-upload-btn" onClick={() => fileRef.current?.click()}>
-                          <Paperclip size={14} />
-                          escolher arquivo
-                        </button>
-                      ) : (
-                        <div className="empty-upload-selected">
-                          <div className="empty-upload-file">
-                            <div className="empty-upload-file-label">Arquivo escolhido</div>
-                            <div className="empty-upload-file-name">{file.name}</div>
-                          </div>
-                          <div className="empty-upload-actions">
-                            <button
-                              className="empty-upload-btn"
-                              onClick={() => void handleUpload()}
-                              disabled={uploading}
-                            >
-                              {uploading ? 'enviando...' : 'iniciar ingestao'}
-                            </button>
-                            <button className="empty-upload-remove" onClick={clearSelectedFile}>
-                              <X size={14} />
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {uploadMsg && (
-                        <div className={`empty-upload-status ${uploadMsg === 'err' ? 'error' : ''}`}>
-                          {uploadMsg === 'ok'
-                            ? uploadError || 'Ingestao iniciada.'
-                            : uploadError || 'Falha no upload.'}
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="ops-section">
-                      <div className="ops-section-head">
-                        <span>Camadas</span>
-                      </div>
-                      <div className="ops-list">
-                        <div className="ops-item queued">
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">Bronze</div>
-                            <div className="ops-item-meta">Recebimento do arquivo bruto e metadados.</div>
-                          </div>
-                        </div>
-                        <div className="ops-item processing">
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">Prata</div>
-                            <div className="ops-item-meta">Extracao e normalizacao para markdown estruturado.</div>
-                          </div>
-                        </div>
-                        <div className="ops-item">
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">Ouro</div>
-                            <div className="ops-item-meta">Chunking, embeddings e indexacao vetorial.</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="ops-panel glass-panel ops-card ops-card-jobs">
-                  <div className="ops-header">
-                    <div>
-                      <div className="ops-kicker">Execucao</div>
-                      <div className="ops-title">Jobs de Ingestao</div>
-                    </div>
-                  </div>
-                  {jobsSupported ? (
-                    <div className="ops-list ops-list-compact">
-                      {visibleJobs.length === 0 ? (
-                        <div className="ops-empty">Nenhum job encontrado.</div>
-                      ) : (
-                        visibleJobs.map((job) => (
-                          <div key={job.id} className={`ops-item ${job.status}`}>
-                            <div className="ops-item-main">
-                              <div className="ops-item-title">{job.filename || job.doc_id}</div>
-                              <div className="ops-item-meta">
-                                {stageLabel(job.status)} • chunks: {job.chunks_indexed}
-                              </div>
-                              <div className="ops-item-meta">
-                                inicio: {job.started_at || '-'} • fim: {job.finished_at || '-'}
-                              </div>
-                              <div className="upload-progress-wrap">
-                                <div className="upload-progress-bar">
-                                  <div
-                                    className="upload-progress-fill"
-                                    style={{ width: `${job.progress_pct ?? stageProgress(job.status)}%` }}
-                                  />
-                                </div>
-                                <div className="upload-progress-text">
-                                  {job.progress_pct ?? stageProgress(job.status)}% • etapa {job.stage || 'n/a'}
-                                </div>
-                              </div>
-                              {job.error && <div className="ops-item-error">{job.error}</div>}
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  ) : (
-                    <div className="ops-empty">
-                      Jobs assinc disponíveis apenas quando a rota enterprise esta habilitada.
-                    </div>
-                  )}
-                </section>
-
-                {baseMode === 'tabular' && (
-                  <section className="ops-panel glass-panel ops-card ops-card-docs">
-                    <div className="ops-header">
-                      <div>
-                        <div className="ops-kicker">Semantica</div>
-                        <div className="ops-title">Perfil da Base</div>
-                      </div>
-                      <button className="ops-refresh" onClick={() => void refreshIngestionData()}>
-                        <RefreshCw size={14} />
-                        atualizar
-                      </button>
-                    </div>
-                    {semanticLoading ? (
-                      <div className="ops-empty">Carregando perfil semantico...</div>
-                    ) : semanticError ? (
-                      <div className="ops-item-error">{semanticError}</div>
-                    ) : !semanticProfile || semanticProfile.columns.length === 0 ? (
-                      <div className="ops-empty">O perfil semantico aparecera apos a ingestao tabular da base.</div>
-                    ) : (
-                      <div className="ops-list ops-list-compact">
-                        <div className="ops-item">
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">Contexto e Sujeito</div>
-                            <div className="ops-item-meta">
-                              sujeito: {semanticProfile.profile?.subject_label || 'registros'}
-                            </div>
-                            <div className="ops-item-meta">
-                              tipo detectado: {(
-                                semanticProfile.profile?.table_type === 'catalog'
-                                  ? 'Catalogo/Codigos'
-                                  : semanticProfile.profile?.table_type === 'time_series'
-                                    ? 'Serie temporal'
-                                    : semanticProfile.profile?.table_type === 'transactional'
-                                      ? 'Transacional'
-                                      : semanticProfile.profile?.table_type === 'mixed'
-                                        ? 'Misto'
-                                        : 'Planilhas/Tabelas analiticas'
-                              )}
-                            </div>
-                            <div className="ops-item-meta">
-                              {semanticProfile.profile?.base_context || tableContext || 'Sem contexto salvo.'}
-                            </div>
-                          </div>
-                        </div>
-                        {tabularEval && (
-                          <div className="ops-item">
-                            <div className="ops-item-main">
-                              <div className="ops-item-title">Benchmark Tabular</div>
-                              <div className="ops-item-meta">
-                                planner: {(tabularEval.summary.tabular_plan_success_rate * 100).toFixed(0)}% •
-                                unidade: {(tabularEval.summary.unit_render_accuracy * 100).toFixed(0)}% •
-                                schema: {(tabularEval.summary.schema_question_success_rate * 100).toFixed(0)}%
-                              </div>
-                              <div className="ops-item-meta">
-                                dataset: {tabularEval.dataset || 'tabular_gold'} • casos: {tabularEval.cases}
-                              </div>
-                              {tabularEval.suites && (
-                                <div className="ops-item-meta">
-                                  suites: {Object.keys(tabularEval.suites).join(', ')}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                        {semanticProfile.columns.slice(0, 8).map((col) => (
-                          <div key={col.column_name} className="ops-item">
-                            <div className="ops-item-main">
-                              <div className="ops-item-title">
-                                {col.column_name} • {col.semantic_type}
-                              </div>
-                              <div className="ops-item-meta">
-                                role: {col.role} • unidade: {col.unit || 'n/a'} • cardinalidade: {col.cardinality}
-                              </div>
-                              <div className="ops-item-meta">{col.description}</div>
-                              <div className="ops-item-meta">
-                                aliases: {col.aliases.slice(0, 5).join(', ') || '-'}
-                              </div>
-                              <div className="ops-item-meta">
-                                operacoes: {col.allowed_operations.join(', ') || '-'}
-                              </div>
-                              {!!semanticProfile.value_catalog?.[col.column_name]?.length && (
-                                <div className="ops-item-meta">
-                                  exemplos reais: {semanticProfile.value_catalog[col.column_name].slice(0, 4).map((item) => item.raw_value).join(', ')}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                        {semanticProfile.columns.length > 8 && (
-                          <div className="ops-empty">
-                            Exibindo 8 de {semanticProfile.columns.length} colunas perfiladas.
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </section>
-                )}
-
-                <section className="ops-panel glass-panel ops-card ops-card-docs">
-                  <div className="ops-header">
-                    <div>
-                      <div className="ops-kicker">Inventario</div>
-                      <div className="ops-title">Documentos na Base</div>
-                    </div>
-                    <button
-                      className="ops-refresh"
-                      onClick={() => void deleteCurrentCollection()}
-                      disabled={deletingCollection || documents.length === 0}
-                      title="Apagar todos os documentos da base selecionada"
-                    >
-                      {deletingCollection ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                      apagar base
-                    </button>
-                  </div>
-                  <div className="ops-list ops-list-compact">
-                    {documents.length === 0 ? (
-                      <div className="ops-empty">Sem documentos para a colecao selecionada.</div>
-                    ) : (
-                      documents.map((doc) => (
-                        <div key={doc.id} className={`ops-item ${doc.status}`}>
-                          <div className="ops-item-main">
-                            <div className="ops-item-title">{doc.filename || doc.doc_id}</div>
-                            <div className="ops-item-meta">
-                              {stageLabel(doc.status)} • chunks: {doc.chunks_indexed}
-                            </div>
-                            <div className="upload-progress-wrap">
-                              <div className="upload-progress-bar">
-                                <div
-                                  className="upload-progress-fill"
-                                  style={{ width: `${stageProgress(doc.status)}%` }}
-                                />
-                              </div>
-                              <div className="upload-progress-text">{stageProgress(doc.status)}%</div>
-                            </div>
-                            {doc.error && <div className="ops-item-error">{doc.error}</div>}
-                          </div>
-                          <div style={{ display: 'grid', gap: 8 }}>
-                            <button
-                              className="ops-delete"
-                              onClick={() => void openArtifacts(doc)}
-                              disabled={artifactLoadingId === doc.id}
-                              aria-label={`Preview ${doc.filename || doc.doc_id}`}
-                              title="Preview Prata (Markdown/JSON)"
-                            >
-                              {artifactLoadingId === doc.id ? <Loader2 size={14} className="animate-spin" /> : 'P'}
-                            </button>
-                            <button
-                              className="ops-delete"
-                              onClick={() => void deleteDocument(doc)}
-                              disabled={deletingDocId === doc.id}
-                              aria-label={`Excluir ${doc.filename || doc.doc_id}`}
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </section>
-
-                <section className="ops-panel glass-panel ops-card ops-card-preview">
-                  <div className="ops-header">
-                    <div>
-                      <div className="ops-kicker">Prata</div>
-                      <div className="ops-title">Preview de Artefatos</div>
-                    </div>
-                  </div>
-                  {artifactError && <div className="ops-item-error">{artifactError}</div>}
-                  {!artifactPreview && !artifactError && (
-                    <div className="ops-empty">
-                      Selecione um documento em "Documentos na Base" para visualizar markdown/json extraido.
-                    </div>
-                  )}
-                  {artifactPreview && (
-                    <div className="ops-section">
-                      <div className="ops-section-head">
-                        <span>{artifactPreview.doc_id}</span>
-                        <div style={{ display: 'inline-flex', gap: 8 }}>
-                          <button
-                            className="ops-refresh"
-                            onClick={() => void downloadArtifact('markdown')}
-                            disabled={!artifactPreview.markdown_preview}
-                            title="Baixar markdown"
-                          >
-                            <Download size={14} />
-                            md
-                          </button>
-                          <button
-                            className="ops-refresh"
-                            onClick={() => void downloadArtifact('json')}
-                            disabled={!artifactPreview.json_preview}
-                            title="Baixar json"
-                          >
-                            <Download size={14} />
-                            json
-                          </button>
-                        </div>
-                      </div>
-                      <div className="view-tabs" style={{ marginBottom: 10 }}>
-                        <button
-                          className={`view-tab ${artifactTab === 'markdown' ? 'active' : ''}`}
-                          onClick={() => setArtifactTab('markdown')}
-                          disabled={!artifactPreview.markdown_preview}
-                        >
-                          Markdown
-                        </button>
-                        <button
-                          className={`view-tab ${artifactTab === 'json' ? 'active' : ''}`}
-                          onClick={() => setArtifactTab('json')}
-                          disabled={!artifactPreview.json_preview}
-                        >
-                          JSON
-                        </button>
-                      </div>
-                      <div className="source-card" style={{ maxHeight: 360, overflow: 'auto' }}>
-                        <pre className="msg-prose" style={{ whiteSpace: 'pre-wrap', margin: 0 }}>
-                          {artifactTab === 'markdown'
-                            ? artifactPreview.markdown_preview || 'Sem markdown disponivel.'
-                            : artifactPreview.json_preview || 'Sem JSON disponivel.'}
-                        </pre>
-                      </div>
-                    </div>
-                  )}
-                </section>
-              </div>
-            </div>
+            <IngestionPanel
+              baseMode={baseMode}
+              isModeLocked={isModeLocked}
+              suggestedMode={suggestedMode}
+              documents={documents}
+              file={file}
+              uploading={uploading}
+              uploadMsg={uploadMsg}
+              uploadError={uploadError}
+              tableContext={tableContext}
+              tableContextDirty={tableContextDirty}
+              jobsSupported={jobsSupported}
+              visibleJobs={visibleJobs}
+              deletingCollection={deletingCollection}
+              deletingDocId={deletingDocId}
+              artifactPreview={artifactPreview}
+              artifactLoadingId={artifactLoadingId}
+              artifactError={artifactError}
+              artifactTab={artifactTab}
+              semanticProfile={semanticProfile}
+              semanticLoading={semanticLoading}
+              semanticError={semanticError}
+              tabularEval={tabularEval}
+              deadlineReport={deadlineReport}
+              baseSummary={baseSummary}
+              timelineSteps={timelineSteps.map((step) => ({ ...step }))}
+              focusTarget={ingestionFocusTarget}
+              onFocusHandled={() => setIngestionFocusTarget(null)}
+              onRefresh={refreshIngestionData}
+              onModeChange={onModeChange}
+              onTableContextChange={(value) => {
+                setTableContext(value)
+                setTableContextDirty(true)
+              }}
+              onSaveTableContext={saveTableContext}
+              onPickFile={() => fileRef.current?.click()}
+              onUpload={handleUpload}
+              onClearSelectedFile={clearSelectedFile}
+              onDeleteCurrentCollection={deleteCurrentCollection}
+              onOpenArtifacts={openArtifacts}
+              onDeleteDocument={deleteDocument}
+              onDownloadArtifact={downloadArtifact}
+              onArtifactTabChange={setArtifactTab}
+            />
           )}
         </div>
       </main>

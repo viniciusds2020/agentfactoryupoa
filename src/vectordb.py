@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
@@ -74,7 +76,12 @@ def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
 def _build_index(vectors: np.ndarray):
     settings = get_settings()
     dim = int(vectors.shape[1])
+    num_vectors = int(vectors.shape[0])
     index_type = (settings.faiss_index_type or "flat").strip().lower()
+
+    # Auto-select HNSW for large collections
+    if index_type == "auto":
+        index_type = "hnsw" if num_vectors > 10_000 else "flat"
 
     if index_type == "hnsw":
         m = max(4, int(settings.faiss_hnsw_m))
@@ -136,8 +143,43 @@ class _FaissCollection:
             "documents": self.documents,
             "metadatas": self.metadatas,
         }
-        self.data_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        np.save(self.vectors_file, self.embeddings.astype(np.float32, copy=False))
+        # Atomic write: temp file in the same directory + rename.
+        # Using NamedTemporaryFile avoids Windows issues with np.save adding ".npy"
+        # to synthetic temp suffixes like ".npy.tmp".
+        tmp_data_path = None
+        tmp_vectors_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                dir=self.base_dir,
+                prefix="data_",
+                suffix=".json.tmp",
+            ) as tmp_data:
+                tmp_data.write(json.dumps(payload, ensure_ascii=False))
+                tmp_data_path = Path(tmp_data.name)
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                delete=False,
+                dir=self.base_dir,
+                prefix="vectors_",
+                suffix=".npy.tmp",
+            ) as tmp_vectors:
+                np.save(tmp_vectors, self.embeddings.astype(np.float32, copy=False))
+                tmp_vectors.flush()
+                tmp_vectors_path = Path(tmp_vectors.name)
+
+            os.replace(str(tmp_data_path), str(self.data_file))
+            os.replace(str(tmp_vectors_path), str(self.vectors_file))
+        finally:
+            for temp_path in (tmp_data_path, tmp_vectors_path):
+                if temp_path and temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
 
     def _rebuild_state(self) -> None:
         self._id_to_pos = {cid: i for i, cid in enumerate(self.ids)}

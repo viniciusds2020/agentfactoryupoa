@@ -115,6 +115,53 @@ def test_get_collection_semantic_profile(monkeypatch):
     assert payload["value_catalog"]["renda_mensal"][0]["raw_value"] == "1000"
 
 
+def test_get_collection_deadline_report(monkeypatch):
+    monkeypatch.setattr(
+        "app.get_table_profile",
+        lambda workspace_id, collection: {
+            "workspace_id": workspace_id,
+            "collection": collection,
+            "table_name": "rol_records",
+            "base_context": "Catalogo de procedimentos",
+            "subject_label": "procedimentos",
+            "table_type": "catalog",
+            "created_at": "2026-04-02 10:00:00",
+            "updated_at": "2026-04-02 10:00:00",
+        },
+    )
+
+    monkeypatch.setattr("src.structured_store.has_structured_data", lambda collection: True)
+    monkeypatch.setattr(
+        "src.structured_store.plan_query",
+        lambda collection, question, context_hint="": {
+            "intent": "catalog_deadline_report",
+            "operation": "catalog_deadline_report",
+            "group_by": ["prazo_faixa"],
+            "aggregation": "count",
+            "filters": [],
+        },
+    )
+    monkeypatch.setattr(
+        "src.structured_store.execute_plan",
+        lambda collection, plan: {
+            "report": {
+                "total_procedimentos": 4,
+                "faixas": [{"faixa": "Imediato", "count": 2, "pct": 50.0}],
+                "alertas": [{"codigo": "10101039", "titulo": "Consulta em pronto socorro", "prazo": "Urgencia/Emergencia - imediato"}],
+            }
+        },
+    )
+
+    response = client.get("/api/v1/collections/rol/deadline-report")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collection"] == "rol"
+    assert payload["total_procedimentos"] == 4
+    assert payload["faixas"][0]["faixa"] == "Imediato"
+    assert payload["alertas"][0]["codigo"] == "10101039"
+
+
 def test_ingest_returns_422_with_underlying_error_detail(monkeypatch):
     monkeypatch.setattr("src.ingestion.ingest", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("parser failure")))
 

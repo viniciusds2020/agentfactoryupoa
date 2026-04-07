@@ -7,7 +7,12 @@ data/history.db
 data/history.db-shm
 data/history.db-wal
 data/controlplane.db
+data/controlplane.db-shm
+data/controlplane.db-wal
 data/structured.duckdb
+data/structured.duckdb.wal
+data/tmp_verify.duckdb
+data/tmp_verify.duckdb.wal
 data/processed/
 data/docs/
 !data/docs/.gitkeep
@@ -26,11 +31,15 @@ build/
 # ── Frontend ─────────────────────────────────────────────────────────────────
 frontend/dist/
 frontend/node_modules/
+frontend/coverage/
+frontend/.vite/
+frontend/.vitest/
 node_modules/
 
 # ── Test / coverage ──────────────────────────────────────────────────────────
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
 .tox/
 

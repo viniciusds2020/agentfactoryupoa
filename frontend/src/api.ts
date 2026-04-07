@@ -132,6 +132,25 @@ export interface CollectionSemanticProfile {
   value_catalog: Record<string, ValueCatalogItem[]>
 }
 
+export interface DeadlineFaixa {
+  faixa: string
+  count: number
+  pct: number
+}
+
+export interface DeadlineAlert {
+  codigo: string
+  titulo: string
+  prazo: string
+}
+
+export interface DeadlineReport {
+  collection: string
+  total_procedimentos: number
+  faixas: DeadlineFaixa[]
+  alertas: DeadlineAlert[]
+}
+
 export interface TabularEvaluation {
   cases: number
   summary: Record<string, number>
@@ -334,6 +353,9 @@ export const api = {
 
   getCollectionSemanticProfile: (collection: string) =>
     req<CollectionSemanticProfile>(`/collections/${encodeURIComponent(collection)}/semantic-profile`),
+
+  getDeadlineReport: (collection: string) =>
+    req<DeadlineReport>(`/collections/${encodeURIComponent(collection)}/deadline-report`),
 
   listIngestionJobs: (limit = 50) =>
     req<IngestionJob[]>(`/ingest/jobs?limit=${encodeURIComponent(String(limit))}`),

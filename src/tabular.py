@@ -213,6 +213,8 @@ def chunk_tabular_records(
     records: list[TableRecord],
     group_size: int = 5,
     max_chunk_chars: int = 512,
+    force_single_row: bool = False,
+    header_columns: list[str] | None = None,
 ) -> list[tuple[str, dict]]:
     chunks: list[tuple[str, dict]] = []
     if not records:
@@ -226,6 +228,8 @@ def chunk_tabular_records(
         if not buf:
             return
         text = "\n".join(rec.texto_canonico for rec in buf)
+        if header_columns:
+            text = f"colunas: {' | '.join(header_columns)}\n{text}"
         metadata = {
             "chunk_type": "tabular",
             "row_start": buf[0].row_index,
@@ -234,18 +238,22 @@ def chunk_tabular_records(
             "page_number": buf[0].page_number,
             "fields": buf[0].fields if len(buf) == 1 else {},
             "raw_rows": [rec.raw_row for rec in buf],
+            "header_columns": header_columns or [],
         }
         chunks.append((text, metadata))
         buf = []
         buf_len = 0
 
     for rec in records:
-        rec_len = len(rec.texto_canonico)
-        if rec_len > max_chunk_chars:
-            _flush()
+        if force_single_row:
+            text = rec.texto_canonico
+            if header_columns:
+                text = f"colunas: {' | '.join(header_columns)}\n{text}"
+            if len(text) > max_chunk_chars:
+                text = text[:max_chunk_chars]
             chunks.append(
                 (
-                    rec.texto_canonico[:max_chunk_chars],
+                    text,
                     {
                         "chunk_type": "tabular",
                         "row_start": rec.row_index,
@@ -254,6 +262,30 @@ def chunk_tabular_records(
                         "page_number": rec.page_number,
                         "fields": rec.fields,
                         "raw_rows": [rec.raw_row],
+                        "header_columns": header_columns or [],
+                    },
+                )
+            )
+            continue
+        rec_len = len(rec.texto_canonico)
+        if rec_len > max_chunk_chars:
+            _flush()
+            text = rec.texto_canonico[:max_chunk_chars]
+            if header_columns:
+                prefix = f"colunas: {' | '.join(header_columns)}\n"
+                text = (prefix + rec.texto_canonico)[:max_chunk_chars]
+            chunks.append(
+                (
+                    text,
+                    {
+                        "chunk_type": "tabular",
+                        "row_start": rec.row_index,
+                        "row_end": rec.row_index,
+                        "row_count": 1,
+                        "page_number": rec.page_number,
+                        "fields": rec.fields,
+                        "raw_rows": [rec.raw_row],
+                        "header_columns": header_columns or [],
                     },
                 )
             )

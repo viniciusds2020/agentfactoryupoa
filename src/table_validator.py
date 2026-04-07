@@ -86,9 +86,10 @@ def validate_query_plan(plan: dict, profiles: list[dict]) -> ValidationResult:
         elif target_column not in profile_map:
             errors.append(f"target_column desconhecida: {target_column}")
 
-    if intent in {"catalog_lookup_by_id", "catalog_lookup_by_title", "catalog_record_summary", "catalog_compare"}:
+    if intent in {"catalog_lookup_by_id", "catalog_lookup_by_title", "catalog_record_summary", "catalog_compare", "catalog_filter", "catalog_deadline_report", "catalog_sla_alert"}:
         if not (plan.get("filters") or []):
-            errors.append("filtros obrigatorios para lookup/catalogo")
+            if intent not in {"catalog_deadline_report"}:
+                errors.append("filtros obrigatorios para lookup/catalogo")
 
     if intent == "catalog_field_lookup":
         if not target_column:
@@ -101,7 +102,8 @@ def validate_query_plan(plan: dict, profiles: list[dict]) -> ValidationResult:
     for flt in plan.get("filters", []) or []:
         column = flt.get("column")
         if column and column not in profile_map:
-            errors.append(f"filter column desconhecida: {column}")
+            if column not in {"prazo_dias", "prazo_faixa", "prazo_urgencia", "requer_autorizacao"}:
+                errors.append(f"filter column desconhecida: {column}")
 
     confidence = float(plan.get("confidence", 0.0) or 0.0)
     normalized["confidence"] = max(0.0, min(confidence, 1.0))

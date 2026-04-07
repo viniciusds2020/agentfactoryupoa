@@ -75,10 +75,12 @@ def infer_semantic_column(column_name: str, numeric_ratio: float) -> SemanticCol
         return SemanticColumn("dimension_organization", "text", "Organizacao ou entidade de negocio.")
     if re.search(r"(status|situacao)", name):
         return SemanticColumn("dimension_status", "text", "Dimensao de status ou situacao.")
-    if re.search(r"(segmento|categoria|tipo|canal|departamento)", name):
+    if re.search(r"(segmento|segmentacao|categoria|tipo|canal|departamento)", name):
         return SemanticColumn("dimension_category", "text", "Dimensao categorica de negocio.")
     if re.search(r"(percent|percentual|taxa|aliquota|pct)", name):
         return SemanticColumn("measure_percentage", "percent", "Medida percentual.")
+    if re.search(r"(emergencia|urgencia)", name):
+        return SemanticColumn("flag_boolean", "boolean", "Indicador de atendimento de emergencia ou urgencia.")
     if re.search(r"(ativo|flag|boolean|is_|tem_|possui_)", name):
         return SemanticColumn("flag_boolean", "boolean", "Indicador booleano ou de presenca.")
     if re.search(r"(idade|age)", name):
@@ -144,6 +146,37 @@ def infer_table_type(profiles: list[dict] | list[object], context_hint: str = ""
     if date_count >= 1 and category_count >= 2 and metric_count == 0:
         return "mixed"
     return "analytic"
+
+
+def infer_profiles_from_records(column_names: list[str], records: list[object], sample_size: int = 50) -> list[dict]:
+    sampled = list(records[:sample_size]) if records else []
+    profiles: list[dict] = []
+    for column_name in column_names:
+        non_empty = 0
+        numeric = 0
+        for record in sampled:
+            fields = getattr(record, "fields", {}) or {}
+            value = str(fields.get(column_name, "") or "").strip()
+            if not value:
+                continue
+            non_empty += 1
+            normalized = value.replace(".", "").replace(",", ".")
+            try:
+                float(normalized)
+                numeric += 1
+            except Exception:
+                pass
+        numeric_ratio = (numeric / non_empty) if non_empty else 0.0
+        semantic = infer_semantic_column(column_name, numeric_ratio)
+        profiles.append(
+            {
+                "name": column_name,
+                "semantic_type": semantic.semantic_type,
+                "role": semantic_role_for_type(semantic.semantic_type),
+                "unit": semantic.unit,
+            }
+        )
+    return profiles
 
 
 def render_value_by_unit(value, unit: UnitType, aggregation: str | None = None) -> str:

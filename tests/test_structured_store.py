@@ -479,3 +479,104 @@ def test_execute_plan_groupby_month_generates_bucketed_sql(tmp_path, monkeypatch
     assert result is not None
     assert result["operation"] == "groupby"
     assert "strftime(" in result["sql_generated"]
+
+
+def test_upsert_records_populates_deadline_derivatives(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "20017 | Visita Domiciliar",
+            "texto_canonico": "procedimento: 20017; prazo_autorizacao: ate 10 dias uteis; orientacao_autorizacao: Necessita autorizacao da Unidade",
+            "fields": {
+                "procedimento": "20017",
+                "descricao_unimed_poa": "Visita Domiciliar",
+                "prazo_autorizacao": "Atendimento em regime de internacao eletiva - ate 10 (dez) dias uteis",
+                "orientacao_autorizacao": "Necessita autorizacao da Unidade",
+            },
+        }
+    ]
+    structured_store.upsert_records(
+        "rol_deadline",
+        "doc-1",
+        records,
+        ["procedimento", "descricao_unimed_poa", "prazo_autorizacao", "orientacao_autorizacao"],
+    )
+
+    rows = structured_store.query_structured("rol_deadline", {"codigo": "20017"})
+    assert rows
+    assert rows[0]["prazo_dias"] == 10
+    assert rows[0]["prazo_faixa"] == "Ate 10 dias"
+    assert rows[0]["prazo_urgencia"] == "medio"
+    assert rows[0]["requer_autorizacao"] == "true"
+
+
+def test_plan_query_catalog_filter_for_emergencia(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "10101039 | Consulta em pronto socorro",
+            "texto_canonico": "procedimento: 10101039; descricao_unimed_poa: Consulta em pronto socorro; emergencia: SIM",
+            "fields": {"procedimento": "10101039", "descricao_unimed_poa": "Consulta em pronto socorro", "emergencia": "SIM"},
+        }
+    ]
+    structured_store.upsert_records("rol_emergencia", "doc-1", records, ["procedimento", "descricao_unimed_poa", "emergencia"])
+
+    plan = structured_store.plan_query("rol_emergencia", "Quais procedimentos sao de emergencia?", context_hint="Catalogo de procedimentos")
+
+    assert plan is not None
+    assert plan["intent"] == "catalog_filter"
+    assert any(f["column"] == "emergencia" and f["value"] == "SIM" for f in plan["filters"])
+
+
+def test_execute_plan_catalog_deadline_report(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "structured.duckdb")
+    monkeypatch.setattr("src.structured_store.get_settings", lambda: _settings(db_path))
+    structured_store._CONN = None
+    structured_store._BACKEND = ""
+
+    records = [
+        {
+            "row_index": 0,
+            "page_number": 1,
+            "raw_row": "10101039 | Consulta em pronto socorro",
+            "texto_canonico": "procedimento: 10101039; descricao_unimed_poa: Consulta em pronto socorro; prazo_autorizacao: Urgencia/Emergencia - imediato",
+            "fields": {
+                "procedimento": "10101039",
+                "descricao_unimed_poa": "Consulta em pronto socorro",
+                "prazo_autorizacao": "Urgencia/Emergencia - imediato",
+            },
+        },
+        {
+            "row_index": 1,
+            "page_number": 1,
+            "raw_row": "20017 | Visita Domiciliar",
+            "texto_canonico": "procedimento: 20017; descricao_unimed_poa: Visita Domiciliar; prazo_autorizacao: ate 10 dias uteis",
+            "fields": {
+                "procedimento": "20017",
+                "descricao_unimed_poa": "Visita Domiciliar",
+                "prazo_autorizacao": "Atendimento em regime de internacao eletiva - ate 10 (dez) dias uteis",
+            },
+        },
+    ]
+    structured_store.upsert_records("rol_report", "doc-1", records, ["procedimento", "descricao_unimed_poa", "prazo_autorizacao"])
+
+    plan = structured_store.plan_query("rol_report", "Relatorio de prazos", context_hint="Catalogo de procedimentos")
+    result = structured_store.execute_plan("rol_report", plan)
+
+    assert result is not None
+    assert result["operation"] == "catalog_deadline_report"
+    assert result["report"]["total_procedimentos"] == 2
+    assert any(item["faixa"] == "Imediato" for item in result["report"]["faixas"])
+    assert any(item["codigo"] == "10101039" for item in result["report"]["alertas"])

@@ -151,6 +151,64 @@ def render_table_answer(question: str, plan: dict, result: dict, context_hint: s
         answer = f"{subject} possui {field_label}: {value}."
         return answer + assumption_text, str(value)
 
+    if intent == "catalog_filter":
+        rows = result.get("rows", []) or []
+        profiles = result.get("profiles", []) or []
+        if not rows:
+            answer = "Nao encontrei procedimentos que atendam a esse criterio."
+            return answer + assumption_text, answer
+        examples: list[str] = []
+        for row in rows[:7]:
+            code = _catalog_first_value(row, profiles, {"identifier"}, ["procedimento", "codigo", "code", "id"])
+            title = _catalog_first_value(row, profiles, {"catalog_title"}, ["descricao_unimed_poa", "descricao", "titulo", "title", "nome"])
+            coverage = _catalog_first_value(row, profiles, {"coverage_rule"}, ["cobertura_unimed_poa", "cobertura"])
+            label = f"{code} - {title}".strip(" -")
+            if coverage:
+                label += f" ({coverage})"
+            examples.append(label)
+        answer = f"Encontrei {len(rows)} procedimentos. Exemplos: {'; '.join(examples)}."
+        return answer + assumption_text, "; ".join(examples)
+
+    if intent == "catalog_deadline_report":
+        report = result.get("report") or {}
+        faixas = report.get("faixas", []) or []
+        total = int(report.get("total_procedimentos") or 0)
+        if not faixas:
+            answer = "Nao encontrei prazos suficientes para montar o relatorio do catalogo."
+            return answer + assumption_text, answer
+        lines = ["Relatorio de prazos do catalogo:"]
+        preview_parts: list[str] = []
+        for item in faixas:
+            faixa = str(item.get("faixa") or "Desconhecido")
+            count = int(item.get("count") or 0)
+            pct = float(item.get("pct") or 0.0)
+            lines.append(f"- {faixa}: {count} procedimentos ({pct:.0f}%)")
+            preview_parts.append(f"{faixa}: {count}")
+        if total:
+            lines.append(f"Total de procedimentos analisados: {total}.")
+        answer = "\n".join(lines)
+        return answer + assumption_text, "; ".join(preview_parts)
+
+    if intent == "catalog_sla_alert":
+        rows = result.get("rows", []) or []
+        profiles = result.get("profiles", []) or []
+        if not rows:
+            answer = "Nao encontrei procedimentos com alerta de SLA para esse criterio."
+            return answer + assumption_text, answer
+        lines = [f"{len(rows)} procedimento(s) exigem atencao imediata:"]
+        preview_parts: list[str] = []
+        for row in rows[:7]:
+            code = _catalog_first_value(row, profiles, {"identifier"}, ["procedimento", "codigo", "code", "id"])
+            title = _catalog_first_value(row, profiles, {"catalog_title"}, ["descricao_unimed_poa", "descricao", "titulo", "title", "nome"])
+            deadline = _catalog_first_value(row, profiles, {"deadline_rule"}, ["prazo_autorizacao_conforme_rn_n_623_ans", "prazo_autorizacao", "prazo"])
+            label = f"- {code} - {title}"
+            if deadline:
+                label += f" ({deadline})"
+            lines.append(label)
+            preview_parts.append(f"{code}: {deadline or title}")
+        answer = "\n".join(lines)
+        return answer + assumption_text, "; ".join(preview_parts)
+
     if intent == "catalog_record_summary":
         record = result.get("record") or {}
         profiles = result.get("profiles", []) or []

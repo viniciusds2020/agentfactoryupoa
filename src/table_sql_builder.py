@@ -48,15 +48,27 @@ def build_sql_for_plan(table: str, plan: dict, backend: str = "duckdb") -> tuple
         column = str(flt["column"])
         value = flt.get("value", "")
         if operator in {">", "<", ">=", "<="}:
-            where_parts.append(f"{_as_float_sql(column, backend)} {operator} ?")
-            params.append(float(str(value).replace(",", ".")))
+            if column in {"prazo_dias"}:
+                where_parts.append(f"CAST({column} AS INTEGER) {operator} ?")
+                params.append(int(float(str(value).replace(",", "."))))
+            else:
+                where_parts.append(f"{_as_float_sql(column, backend)} {operator} ?")
+                params.append(float(str(value).replace(",", ".")))
         elif operator == "!=":
             where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) <> ?")
             params.append(str(value).strip().lower())
+        elif operator == "like":
+            where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) LIKE ?")
+            params.append(f"%{str(value).strip().lower()}%")
         elif operator == "between":
             start, end = [part.strip() for part in str(value).split("|", 1)]
             where_parts.append(f"{_as_date_sql(column, backend)} BETWEEN ? AND ?")
             params.extend([start, end])
+        elif operator == "in":
+            values = [item.strip().lower() for item in str(value).split("|") if item.strip()]
+            placeholders = ", ".join(["?"] * len(values))
+            where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) IN ({placeholders})")
+            params.extend(values)
         else:
             where_parts.append(f"LOWER(CAST({column} AS VARCHAR)) = ?")
             params.append(str(value).strip().lower())
@@ -106,6 +118,24 @@ def build_sql_for_plan(table: str, plan: dict, backend: str = "duckdb") -> tuple
             f"SELECT {select_group_clause}, {metric_expr} AS value FROM {table} {where_clause} "
             f"GROUP BY {group_clause} ORDER BY {order_clause} LIMIT ?"
         )
+        return sql, [*params, limit]
+
+    if intent == "catalog_filter":
+        select_cols = "doc_id, row_index, page_number, raw_row, texto_canonico, *"
+        sql = f"SELECT {select_cols} FROM {table} {where_clause} LIMIT ?"
+        return sql, [*params, limit]
+
+    if intent in {"catalog_deadline_report", "catalog_sla_alert"}:
+        group_by = [col for col in plan.get("group_by", []) if col]
+        if intent == "catalog_deadline_report" and group_by:
+            group_clause = ", ".join(group_by)
+            sql = (
+                f"SELECT {group_clause}, COUNT(*) AS value FROM {table} {where_clause} "
+                f"GROUP BY {group_clause} ORDER BY value DESC, {group_clause} ASC LIMIT ?"
+            )
+            return sql, [*params, limit]
+        select_cols = "doc_id, row_index, page_number, raw_row, texto_canonico, *"
+        sql = f"SELECT {select_cols} FROM {table} {where_clause} LIMIT ?"
         return sql, [*params, limit]
 
     if intent == "tabular_rank":

@@ -14,13 +14,45 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.chat import ChatMessage, ChatResult, StreamContext, answer, prepare_stream
 from src.config import get_settings
+from src.schemas import (
+    AuditEventOut,
+    ChatRequest,
+    ChatResponse,
+    ChatWithHistoryRequest,
+    ChatWithHistoryResponse,
+    CollectionContextOut,
+    CollectionInfo,
+    CollectionSemanticProfileOut,
+    CollectionStatsOut,
+    ColumnProfileOut,
+    ConversationOut,
+    CreateConversationRequest,
+    CreateWorkspaceRequest,
+    DeadlineAlertOut,
+    DeadlineFaixaOut,
+    DeadlineReportOut,
+    DocumentArtifactsOut,
+    DocumentOut,
+    HealthResponse,
+    IngestResponse,
+    IngestionJobOut,
+    MessageOut,
+    ObservabilityOut,
+    RenameRequest,
+    RetrievalEvaluationOut,
+    SettingsOut,
+    SourceOut,
+    TableProfileOut,
+    TabularEvaluationOut,
+    UpdateCollectionContextRequest,
+    WorkspaceOut,
+)
 from src.controlplane import (
     create_ingestion_job,
     create_workspace,
@@ -153,234 +185,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
             "request_id": request_id,
         },
     )
-
-
-# ── Schemas ──────────────────────────────────────────────────────────────────
-
-
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    environment: str
-
-
-class IngestResponse(BaseModel):
-    collection: str
-    doc_id: str
-    chunks_indexed: int
-
-
-class ChatRequest(BaseModel):
-    collection: str
-    question: str
-    history: list[ChatMessage] = []
-    embedding_model: str | None = None
-    domain_profile: str | None = None
-
-
-class SourceOut(BaseModel):
-    chunk_id: str
-    doc_id: str
-    excerpt: str
-    score: float
-    page_number: int | None = None
-    source_filename: str = ""
-    citation_label: str = ""
-    source_kind: str = ""
-    query_summary: str = ""
-    result_preview: str = ""
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    sources: list[SourceOut]
-    request_id: str
-
-
-class ConversationOut(BaseModel):
-    id: str
-    title: str
-    collection: str
-    embedding_model: str
-    created_at: str
-    updated_at: str
-
-
-class MessageOut(BaseModel):
-    role: str
-    content: str
-    sources: list[SourceOut]
-
-
-class CreateConversationRequest(BaseModel):
-    collection: str
-    embedding_model: str = ""
-    title: str = ""
-
-
-class RenameRequest(BaseModel):
-    title: str
-
-
-class ChatWithHistoryRequest(BaseModel):
-    conversation_id: str | None = None
-    collection: str
-    question: str
-    history: list[ChatMessage] = []
-    embedding_model: str | None = None
-    domain_profile: str | None = None
-
-
-class ChatWithHistoryResponse(BaseModel):
-    conversation_id: str
-    answer: str
-    sources: list[SourceOut]
-    request_id: str
-
-
-class SettingsOut(BaseModel):
-    llm_provider: str
-    llm_model: str
-    embedding_model: str
-    retrieval_top_k: int
-    default_domain_profile: str
-    available_domain_profiles: list[str]
-
-
-class ObservabilityOut(BaseModel):
-    counters: dict[str, int]
-    timers_ms: dict[str, dict[str, float]]
-
-
-class RetrievalEvaluationOut(BaseModel):
-    dataset: str
-    queries: int
-    top_k: int
-    vector: dict[str, float]
-
-
-class WorkspaceOut(BaseModel):
-    id: str
-    name: str
-    api_key: str
-    is_default: bool
-    created_at: str
-
-
-class CreateWorkspaceRequest(BaseModel):
-    name: str
-
-
-class DocumentOut(BaseModel):
-    id: str
-    workspace_id: str
-    collection: str
-    doc_id: str
-    filename: str
-    embedding_model: str
-    status: str
-    chunks_indexed: int
-    error: str
-    context_hint: str
-    created_at: str
-    updated_at: str
-
-
-class UpdateCollectionContextRequest(BaseModel):
-    context_hint: str = ""
-
-
-class CollectionContextOut(BaseModel):
-    collection: str
-    context_hint: str
-    updated_documents: int
-
-
-class TableProfileOut(BaseModel):
-    workspace_id: str
-    collection: str
-    table_name: str
-    base_context: str
-    subject_label: str
-    table_type: str = "analytic"
-    created_at: str
-    updated_at: str
-
-
-class ColumnProfileOut(BaseModel):
-    workspace_id: str
-    collection: str
-    column_name: str
-    display_name: str
-    physical_type: str
-    semantic_type: str
-    role: str
-    unit: str
-    aliases: list[str]
-    examples: list[str]
-    description: str
-    cardinality: int
-    allowed_operations: list[str]
-
-
-class CollectionSemanticProfileOut(BaseModel):
-    collection: str
-    profile: TableProfileOut | None = None
-    columns: list[ColumnProfileOut]
-    value_catalog: dict[str, list[dict]] = {}
-
-
-class CollectionStatsOut(BaseModel):
-    collection: str
-    documents: int
-    chunks_indexed: int
-    updated_at: str
-
-
-class IngestionJobOut(BaseModel):
-    id: str
-    workspace_id: str
-    collection: str
-    doc_id: str
-    filename: str
-    embedding_model: str
-    status: str
-    chunks_indexed: int
-    error: str
-    created_at: str
-    started_at: str
-    finished_at: str
-    stage: str
-    progress_pct: int
-
-
-class DocumentArtifactsOut(BaseModel):
-    doc_id: str
-    markdown_path: str
-    json_path: str
-    markdown_preview: str
-    json_preview: str
-    available: bool
-
-
-class TabularEvaluationOut(BaseModel):
-    cases: int
-    summary: dict[str, float]
-    details: list[dict]
-    dataset: str | None = None
-    context_hint: str | None = None
-    suites: dict[str, dict] | None = None
-
-
-class AuditEventOut(BaseModel):
-    id: int
-    workspace_id: str
-    actor: str
-    event_type: str
-    resource_type: str
-    resource_id: str
-    details: dict
-    created_at: str
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -730,11 +534,6 @@ async def prometheus_metrics_endpoint():
     from src.observability import prometheus_metrics
 
     return Response(content=prometheus_metrics(), media_type="text/plain; version=0.0.4")
-
-
-class CollectionInfo(BaseModel):
-    collection: str
-    embedding_model: str
 
 
 @v1_router.get("/collections/available", response_model=list[CollectionInfo])
@@ -1358,6 +1157,54 @@ def get_collection_semantic_profile(collection: str, request: Request):
     )
 
 
+@v1_router.get("/collections/{collection}/deadline-report", response_model=DeadlineReportOut)
+def get_collection_deadline_report(collection: str, request: Request):
+    workspace = _get_workspace(request)
+    collection = _validate_collection_or_422(collection)
+    try:
+        from src.structured_store import execute_plan, has_structured_data, plan_query
+
+        if not has_structured_data(collection):
+            raise HTTPException(status_code=404, detail="A base ainda nao possui dados tabulares estruturados.")
+        profile = get_table_profile(workspace.id, collection) or {}
+        context_hint = str(profile.get("base_context") or "")
+        plan = plan_query(collection, "Relatorio de prazos", context_hint=context_hint) or {
+            "intent": "catalog_deadline_report",
+            "operation": "catalog_deadline_report",
+            "group_by": ["prazo_faixa"],
+            "aggregation": "count",
+            "filters": [],
+        }
+        result = execute_plan(collection, plan)
+        if not result:
+            raise HTTPException(status_code=404, detail="Nao foi possivel gerar o relatorio de prazos desta base.")
+        report = result.get("report") or {}
+        return DeadlineReportOut(
+            collection=collection,
+            total_procedimentos=int(report.get("total_procedimentos") or 0),
+            faixas=[
+                DeadlineFaixaOut(
+                    faixa=str(item.get("faixa") or "Desconhecido"),
+                    count=int(item.get("count") or 0),
+                    pct=float(item.get("pct") or 0.0),
+                )
+                for item in report.get("faixas", []) or []
+            ],
+            alertas=[
+                DeadlineAlertOut(
+                    codigo=str(item.get("codigo") or ""),
+                    titulo=str(item.get("titulo") or ""),
+                    prazo=str(item.get("prazo") or ""),
+                )
+                for item in report.get("alertas", []) or []
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=_format_internal_error(exc)) from exc
+
+
 @v1_router.delete("/documents/{doc_id}", status_code=204)
 def delete_document(doc_id: str, request: Request, collection: str = Query(...), embedding_model: str | None = Query(default=None)):
     from src import chat, vectordb
@@ -1600,6 +1447,4 @@ def purge_conversations_enterprise(older_than_days: int = Query(default=90, ge=1
 
 
 app.include_router(v1_router)
-
-if not settings.simple_mode:
-    app.include_router(enterprise_router)
+app.include_router(enterprise_router)

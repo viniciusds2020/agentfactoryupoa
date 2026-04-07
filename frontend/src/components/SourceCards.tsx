@@ -3,16 +3,24 @@ import { ChevronDown, FileText } from 'lucide-react'
 import type { Source } from '../api'
 
 export default function SourceCards({ sources }: { sources: Source[] }) {
-  const [open, setOpen] = useState(false)
-  if (!sources.length) return null
   const isTableQuery = sources.every((src) => src.source_kind === 'table_query')
+  const defaultOpen = isTableQuery || sources.length === 1
+  const [open, setOpen] = useState(defaultOpen)
+  if (!sources.length) return null
+  const firstMetaLine = sources[0]?.citation_label || (sources[0]?.page_number ? `pagina ${sources[0].page_number}` : 'trecho referenciado')
+  const summaryLabel = isTableQuery
+    ? `${sources.length} consulta${sources.length > 1 ? 's' : ''} analitica${sources.length > 1 ? 's' : ''} executada${sources.length > 1 ? 's' : ''}`
+    : `${sources.length} fonte${sources.length > 1 ? 's' : ''} consultada${sources.length > 1 ? 's' : ''}`
 
   return (
-    <div>
+    <div className="sources-block">
+      <div className="source-summary">
+        <span className="source-summary-label">Fontes</span>
+        <span className="source-summary-text">{summaryLabel}</span>
+        {!open && sources.length === 1 ? <span className="source-summary-meta">{firstMetaLine}</span> : null}
+      </div>
       <button className="source-toggle" onClick={() => setOpen((o) => !o)}>
-        {isTableQuery
-          ? `${sources.length} consulta${sources.length > 1 ? 's' : ''} analitica${sources.length > 1 ? 's' : ''} executada${sources.length > 1 ? 's' : ''}`
-          : `${sources.length} fonte${sources.length > 1 ? 's' : ''} consultada${sources.length > 1 ? 's' : ''}`}
+        {summaryLabel}
         <ChevronDown
           size={13}
           style={{ transform: open ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }}

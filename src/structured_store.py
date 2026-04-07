@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from src.config import get_settings
+from src.deadline_normalizer import normalize_deadline
 from src.observability import metrics
 from src.table_planner import build_query_plan
 from src.table_sql_builder import build_sql_for_plan
@@ -19,10 +20,18 @@ logger = get_logger(__name__)
 
 _CONN = None
 _BACKEND = ""
+_WRITES_SINCE_CHECKPOINT = 0
+_CHECKPOINT_EVERY = 50  # checkpoint after every 50 writes
 _SYSTEM_COLUMNS = {"doc_id", "row_index", "page_number", "raw_row", "texto_canonico"}
 _NUMERIC_HINTS = {
     "valor", "price", "amount", "total", "receita", "faturamento",
     "custo", "salario", "renda", "score", "nota",
+}
+_DERIVED_DEADLINE_COLUMNS = {
+    "prazo_dias": "INTEGER",
+    "prazo_faixa": "TEXT",
+    "prazo_urgencia": "TEXT",
+    "requer_autorizacao": "TEXT",
 }
 _STATE_NAME_TO_UF = {
     "acre": "AC",
@@ -101,6 +110,33 @@ def get_connection():
     return _CONN
 
 
+def _maybe_checkpoint():
+    global _WRITES_SINCE_CHECKPOINT
+    _WRITES_SINCE_CHECKPOINT += 1
+    if _WRITES_SINCE_CHECKPOINT >= _CHECKPOINT_EVERY:
+        _WRITES_SINCE_CHECKPOINT = 0
+        try:
+            conn = get_connection()
+            if _BACKEND == "duckdb":
+                conn.execute("CHECKPOINT")
+                logger.info("DuckDB checkpoint completed")
+        except Exception:
+            logger.warning("DuckDB checkpoint failed", exc_info=True)
+
+
+def reset_connection():
+    """Reset the global connection. Used by tests to avoid state leakage."""
+    global _CONN, _BACKEND, _WRITES_SINCE_CHECKPOINT
+    if _CONN is not None:
+        try:
+            _CONN.close()
+        except Exception:
+            pass
+    _CONN = None
+    _BACKEND = ""
+    _WRITES_SINCE_CHECKPOINT = 0
+
+
 def ensure_table(collection: str, column_names: list[str]) -> None:
     conn = get_connection()
     table = _table_name(collection)
@@ -121,6 +157,10 @@ def ensure_table(collection: str, column_names: list[str]) -> None:
         norm = _normalize_identifier(col)
         if norm not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {norm} TEXT")
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    for col, sql_type in _DERIVED_DEADLINE_COLUMNS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
 
 
 def upsert_records(collection: str, doc_id: str, records: list, columns: list[str]) -> int:
@@ -154,8 +194,47 @@ def upsert_records(collection: str, doc_id: str, records: list, columns: list[st
         rows_to_insert.append(row)
 
     conn.executemany(sql, rows_to_insert)
+    _populate_deadline_derivatives(collection, doc_id)
     log_event(logger, 20, "Structured records upserted", collection=collection, doc_id=doc_id, rows=len(rows_to_insert))
+    _maybe_checkpoint()
     return len(rows_to_insert)
+
+
+def _populate_deadline_derivatives(collection: str, doc_id: str) -> None:
+    profiles = _infer_column_profiles(collection)
+    deadline_col = next((p.name for p in profiles if p.semantic_type == "deadline_rule"), "")
+    auth_col = next((p.name for p in profiles if p.semantic_type == "authorization_rule"), "")
+    if not deadline_col:
+        return
+    table = _table_name(collection)
+    conn = get_connection()
+    auth_select = f"CAST({auth_col} AS VARCHAR)" if auth_col else "''"
+    cursor = conn.execute(
+        f"SELECT row_index, CAST({deadline_col} AS VARCHAR), {auth_select} FROM {table} WHERE doc_id = ?",
+        [doc_id],
+    )
+    rows = cursor.fetchall()
+    for row_index, deadline_value, auth_value in rows:
+        info = normalize_deadline(str(deadline_value or ""))
+        requires_auth = info.requires_authorization
+        auth_norm = _normalize_text(str(auth_value or ""))
+        if "necessita autorizacao" in auth_norm or "autorizacao obrigatoria" in auth_norm:
+            requires_auth = True
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET prazo_dias = ?, prazo_faixa = ?, prazo_urgencia = ?, requer_autorizacao = ?
+            WHERE doc_id = ? AND row_index = ?
+            """,
+            [
+                info.days,
+                info.faixa,
+                info.urgency,
+                "true" if requires_auth else "false",
+                doc_id,
+                row_index,
+            ],
+        )
 
 
 def query_structured(collection: str, filters: dict, limit: int = 20) -> list[dict]:
@@ -229,6 +308,7 @@ def delete_by_doc_id(collection: str, doc_id: str) -> int:
     try:
         conn = get_connection()
         cursor = conn.execute(f"DELETE FROM {table} WHERE doc_id = ?", [doc_id])
+        _maybe_checkpoint()
         return cursor.rowcount
     except Exception:
         return 0
@@ -379,7 +459,7 @@ def _allowed_operations(semantic_type: str) -> list[str]:
     if semantic_type in {"measure_age_years", "measure_score", "measure_number", "measure_percentage"}:
         return ["avg", "min", "max", "sum"]
     if semantic_type in {"catalog_title", "catalog_attribute", "coverage_rule", "authorization_rule", "deadline_rule"}:
-        return ["lookup", "summary"]
+        return ["lookup", "summary", "filter"]
     if semantic_type.startswith("dimension_") or semantic_type == "flag_boolean":
         return ["filter", "distinct", "group_by"]
     if semantic_type == "identifier":
@@ -711,6 +791,9 @@ def plan_query(collection: str, question: str, context_hint: str = "") -> dict |
         "catalog_field_lookup": "catalog_field_lookup",
         "catalog_record_summary": "catalog_record_summary",
         "catalog_compare": "catalog_compare",
+        "catalog_filter": "catalog_filter",
+        "catalog_deadline_report": "catalog_deadline_report",
+        "catalog_sla_alert": "catalog_sla_alert",
     }
     normalized = dict(validation.normalized_plan)
     normalized["operation"] = operation_by_intent.get(normalized.get("intent", ""), "")
@@ -780,12 +863,19 @@ def execute_plan(collection: str, plan: dict) -> dict | None:
             "sql_generated": "",
         }
 
-    if op in {"catalog_lookup", "catalog_field_lookup", "catalog_record_summary", "catalog_compare"}:
+    if op in {"catalog_lookup", "catalog_field_lookup", "catalog_record_summary", "catalog_compare", "catalog_filter", "catalog_deadline_report", "catalog_sla_alert"}:
         profiles = get_column_profiles(collection)
         rows = _execute_catalog_plan(collection, plan, profiles)
         if not rows:
             return None
         if op == "catalog_compare":
+            return {"operation": op, "rows": rows, "profiles": profiles, "plan": plan, "sql_generated": ""}
+        if op == "catalog_filter":
+            return {"operation": op, "rows": rows, "profiles": profiles, "plan": plan, "sql_generated": ""}
+        if op == "catalog_deadline_report":
+            report = _build_deadline_report(rows, profiles)
+            return {"operation": op, "rows": rows, "profiles": profiles, "report": report, "plan": plan, "sql_generated": ""}
+        if op == "catalog_sla_alert":
             return {"operation": op, "rows": rows, "profiles": profiles, "plan": plan, "sql_generated": ""}
         record = rows[0]
         return {
@@ -856,9 +946,25 @@ def _matches_filter(row: dict, flt: dict) -> bool:
     target = _normalize_text(value)
     if operator == "=":
         return text == target
+    if operator == "!=":
+        return text != target
+    if operator == "like":
+        return target in text
     if operator == "in":
         values = {_normalize_text(item) for item in value.split("|") if item.strip()}
         return text in values
+    if operator in {">", "<", ">=", "<="}:
+        try:
+            left = float(str(raw or "0").replace(",", "."))
+            right = float(str(value).replace(",", "."))
+        except Exception:
+            return False
+        return {
+            ">": left > right,
+            "<": left < right,
+            ">=": left >= right,
+            "<=": left <= right,
+        }[operator]
     return False
 
 
@@ -867,11 +973,14 @@ def _execute_catalog_plan(collection: str, plan: dict, profiles: list[dict]) -> 
     if not rows:
         return []
     matched = rows
+    intent = str(plan.get("intent") or "")
     for flt in plan.get("filters", []) or []:
         matched = [row for row in matched if _matches_filter(row, flt)]
 
     if matched:
-        return matched[:10]
+        if intent == "catalog_deadline_report":
+            return matched
+        return matched[: int(plan.get("limit") or 10)]
 
     # fallback for title lookup with normalized contains
     title_col = next((p["name"] for p in profiles if p.get("semantic_type") == "catalog_title"), "")
@@ -882,5 +991,36 @@ def _execute_catalog_plan(collection: str, plan: dict, profiles: list[dict]) -> 
             target = _normalize_text(str(flt.get("value") or ""))
             fuzzy = [row for row in rows if target and target in _normalize_text(str(row.get(title_col) or ""))]
             if fuzzy:
-                return fuzzy[:10]
+                if intent == "catalog_deadline_report":
+                    return fuzzy
+                return fuzzy[: int(plan.get("limit") or 10)]
     return []
+
+
+def _build_deadline_report(rows: list[dict], profiles: list[dict]) -> dict:
+    total = len(rows)
+    band_counts: dict[str, int] = {}
+    alerts: list[dict] = []
+    code_col = next((p["name"] for p in profiles if p.get("semantic_type") == "identifier"), "procedimento")
+    title_col = next((p["name"] for p in profiles if p.get("semantic_type") == "catalog_title"), "descricao")
+    deadline_col = next((p["name"] for p in profiles if p.get("semantic_type") == "deadline_rule"), "prazo")
+    for row in rows:
+        faixa = str(row.get("prazo_faixa") or "Desconhecido")
+        band_counts[faixa] = band_counts.get(faixa, 0) + 1
+        if str(row.get("prazo_urgencia") or "") in {"imediato", "curto"}:
+            alerts.append(
+                {
+                    "codigo": str(row.get(code_col) or ""),
+                    "titulo": str(row.get(title_col) or ""),
+                    "prazo": str(row.get(deadline_col) or ""),
+                }
+            )
+    faixas = [
+        {
+            "faixa": faixa,
+            "count": count,
+            "pct": round((count / total) * 100, 1) if total else 0.0,
+        }
+        for faixa, count in sorted(band_counts.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return {"faixas": faixas, "alertas": alerts[:10], "total_procedimentos": total}

@@ -9,157 +9,173 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from src.ingestion_cleaning import (
+    _PAGE_BREAK_MARKER,
+    _PAGE_BREAK_RE,
+    _normalize_heading_text,
+    _normalize_markdown,
+    _normalize_structural_headers,
+    _split,
+    _split_sentences,
+    _strip_page_headers,
+    deep_clean_text,
+)
+from src.ingestion_parsers import (
+    _assign_page_numbers as _assign_page_numbers_impl,
+    _build_pdf_page_context as _build_pdf_page_context_impl,
+    _enrich_with_pdf_json_context as _enrich_with_pdf_json_context_impl,
+    _has_line_structure as _has_line_structure_impl,
+    _parse as _parse_impl,
+    _parse_csv as _parse_csv_impl,
+    _parse_docling as _parse_docling_impl,
+    _parse_docling_fast as _parse_docling_fast_impl,
+    _parse_pdf as _parse_pdf_impl,
+    _parse_xlsx as _parse_xlsx_impl,
+)
 from src.utils import chunk_id, get_logger, log_event
 
 logger = get_logger(__name__)
 
+
+def _build_pdf_page_context(blocks: list) -> dict[int, dict]:
+    return _build_pdf_page_context_impl(blocks)
+
+
+def _enrich_with_pdf_json_context(texts_for_embedding: list[str], metadatas: list[dict], pdf_blocks: list) -> list[str]:
+    return _enrich_with_pdf_json_context_impl(texts_for_embedding, metadatas, pdf_blocks)
+
+
+def _parse_xlsx(path: Path) -> tuple[str, dict]:
+    return _parse_xlsx_impl(path)
+
+
+def _parse_csv(path: Path) -> tuple[str, dict]:
+    return _parse_csv_impl(path)
+
+
+def _parse_docling_fast(path: Path) -> tuple[str, dict] | None:
+    return _parse_docling_fast_impl(path)
+
+
+def _has_line_structure(text: str) -> bool:
+    return _has_line_structure_impl(text)
+
+
+def _parse_docling(path: Path) -> tuple[str, dict]:
+    return _parse_docling_impl(path)
+
+
+def _parse_pdf(path: Path) -> tuple[str, dict]:
+    docling_result = _parse_docling_fast(path)
+    if docling_result is not None:
+        text, _meta = docling_result
+        if _has_line_structure(text):
+            log_event(logger, 20, "PDF parsed with docling (markdown with headings)", path=str(path))
+            return docling_result
+        log_event(logger, 20, "Docling output lacks line structure, trying PyMuPDF", path=str(path))
+
+    try:
+        import fitz
+    except ImportError:
+        if docling_result is not None:
+            return docling_result
+        log_event(logger, 30, "PyMuPDF not available, falling back to docling+OCR", path=str(path))
+        return _parse_docling(path)
+
+    doc = fitz.open(str(path))
+    page_count = len(doc)
+    pages: list[str] = []
+    for page in doc:
+        text = page.get_text("text")
+        if text.strip():
+            pages.append(text.strip())
+    doc.close()
+
+    total_chars = sum(len(p) for p in pages)
+    if total_chars > 200:
+        log_event(logger, 20, "PDF parsed with PyMuPDF fallback (plain text)", path=str(path))
+        text = _PAGE_BREAK_MARKER.join(pages)
+        return text, {"page_count": page_count, "parser": "pymupdf"}
+
+    log_event(
+        logger,
+        20,
+        "Both docling-fast and PyMuPDF extracted too little, using docling+OCR",
+        path=str(path),
+        pymupdf_chars=total_chars,
+    )
+    return _parse_docling(path)
+
+
+def _parse(source: str) -> tuple[str, dict]:
+    path = Path(source)
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".md"}:
+        for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+            try:
+                return path.read_text(encoding=encoding), {}
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Unable to decode text file: {suffix}")
+    if suffix in {".xlsx", ".xls"}:
+        return _parse_xlsx(path)
+    if suffix == ".csv":
+        return _parse_csv(path)
+    if suffix == ".pdf":
+        return _parse_pdf(path)
+    if suffix in {".docx", ".pptx"}:
+        return _parse_docling(path)
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def _assign_page_numbers(chunks: list[str], raw_text: str) -> list[int | None]:
+    return _assign_page_numbers_impl(chunks, raw_text)
+
 # Abreviações PT-BR comuns que não devem ser tratadas como fim de frase
-_ABBREVIATIONS = re.compile(
-    r"\b(Art|Inc|Sr|Sra|Dr|Dra|Prof|Ltda|S\.A|Jr|n|p|fl|fls|vol|ed|etc|ex)\.",
-    re.IGNORECASE,
-)
-_ABBREV_PLACEHOLDER = "\x00"
+
 
 # Marker inserted by docling between pages when page_break_placeholder is set.
-_PAGE_BREAK_MARKER = "\n<!-- PAGE_BREAK -->\n"
-_PAGE_BREAK_RE = re.compile(r"<!-- PAGE_BREAK -->")
+
 
 # Patterns for repeated page headers/footers injected by docling.
 # These add noise to chunks and hurt semantic search.
-_PAGE_HEADER_PATTERNS = [
-    # Generic doc management headers (e.g., "Estatuto Social Nº/Rev.: ... Este documento faz parte ...")
-    re.compile(
-        r"^[^\n]{0,200}(?:Nº/Rev\.?:|N°/Rev\.?:)[^\n]*Este documento faz parte[^\n]*\n?",
-        re.MULTILINE | re.IGNORECASE,
-    ),
-    # Download watermarks (e.g., "(Baixado por FULANO em DD/MM/YYYY HH:MM:SS")
-    re.compile(
-        r"\(Baixado por [^\n)]+\)\s*",
-        re.IGNORECASE,
-    ),
-    # "Página X de Y" footers
-    re.compile(r"Página\s+\d+\s+de\s+\d+\s*", re.IGNORECASE),
-    # "Classificação da Informação: ..." lines
-    re.compile(r"Classificação da Informação:\s*\w+\s*", re.IGNORECASE),
-    # Standalone image placeholders
-    re.compile(r"<!--\s*image\s*-->\s*", re.IGNORECASE),
-]
 
 
-def _strip_page_headers(text: str) -> str:
-    """Remove repeated page headers, footers, and watermarks from parsed text."""
-    for pattern in _PAGE_HEADER_PATTERNS:
-        text = pattern.sub("", text)
-    # Collapse multiple blank lines left behind
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+
+
 
 
 # ── Heavy structural cleanup (Gap 6) ────────────────────────────────────────
 
-_HYPHENATED_BREAK_RE = re.compile(r"(\w)-\s*\n\s*(\w)")
-_BROKEN_LINE_RE = re.compile(r"(?<=[a-záàâãéèêíóôõúüç,;])\s*\n\s*(?=[a-záàâãéèêíóôõúüç])", re.IGNORECASE)
-_REPEATED_BLOCK_MIN_LEN = 40  # minimum length to consider a block for dedup
 
 
-def _merge_broken_lines(text: str) -> str:
-    """Repair lines broken mid-word (hyphenation) or mid-sentence.
-
-    Joins 'respons-\\nável' → 'responsável' and lines ending in lowercase
-    followed by lowercase continuation (likely broken by PDF extraction).
-    """
-    # First: merge hyphenated breaks (word-\nword → wordword)
-    text = _HYPHENATED_BREAK_RE.sub(r"\1\2", text)
-    # Second: merge lines broken mid-sentence (lowercase,\nlowercase)
-    text = _BROKEN_LINE_RE.sub(" ", text)
-    return text
 
 
-def _deduplicate_paragraphs(text: str) -> str:
-    """Remove duplicate paragraphs that appear from repeated headers/sections.
-
-    Keeps the first occurrence of each paragraph. Only deduplicates blocks
-    longer than _REPEATED_BLOCK_MIN_LEN to avoid removing legitimate short lines.
-    """
-    lines = text.split("\n\n")
-    seen: set[str] = set()
-    result: list[str] = []
-    for block in lines:
-        stripped = block.strip()
-        if len(stripped) < _REPEATED_BLOCK_MIN_LEN:
-            result.append(block)
-            continue
-        # Normalize for comparison (collapse whitespace, lowercase)
-        key = re.sub(r"\s+", " ", stripped.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(block)
-    return "\n\n".join(result)
 
 
-def _remove_orphan_page_numbers(text: str) -> str:
-    """Remove standalone page numbers (lines containing only a number)."""
-    lines = text.splitlines()
-    result = [line for line in lines if not re.fullmatch(r"\s*\d{1,4}\s*", line)]
-    return "\n".join(result)
 
 
-def _normalize_whitespace(text: str) -> str:
-    """Normalize excessive whitespace while preserving paragraph breaks."""
-    # Collapse 3+ blank lines to 2
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    # Collapse multiple spaces to single (but not newlines)
-    text = re.sub(r"[^\S\n]+", " ", text)
-    return text.strip()
 
 
-def deep_clean_text(text: str) -> str:
-    """Apply heavy structural cleanup for reliable downstream processing.
-
-    Pipeline:
-    1. Merge broken lines (hyphenation and mid-sentence breaks)
-    2. Remove orphan page numbers
-    3. Deduplicate repeated paragraphs
-    4. Normalize whitespace
-    """
-    text = _merge_broken_lines(text)
-    text = _remove_orphan_page_numbers(text)
-    text = _deduplicate_paragraphs(text)
-    text = _normalize_whitespace(text)
-    return text
 
 
-_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+
+
+
+
+
+
+
 _WRAPPED_STRUCTURAL_LINE_RE = re.compile(
     r"^\s*[\[(]\s*((?:T[IÃ]TULO|CAP[IÃ]TULO|SE[CÃ‡][AÃƒ]O)\s+[IVXLCDM\d]+(?:\s*[-â€“â€”:\.]\s*.+)?)\s*[\])]\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 
-def _normalize_markdown(text: str) -> str:
-    """Strip markdown heading prefixes so section detection regexes work.
-
-    Converts ``## CAPÍTULO I - Foo`` to ``CAPÍTULO I - Foo``.
-    Preserves the heading text and line position.
-    """
-    return _MARKDOWN_HEADING_RE.sub("", text)
 
 
-def _normalize_structural_headers(text: str) -> str:
-    """Normalize wrapped headings so section regexes can detect them."""
-    normalized_lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if (
-            stripped.startswith(("[", "("))
-            and stripped.endswith(("]", ")"))
-            and any(token in stripped.upper() for token in ("CAP", "TIT", "SE"))
-        ):
-            normalized_lines.append(stripped[1:-1].strip())
-        else:
-            normalized_lines.append(line)
-    return "\n".join(normalized_lines)
+
+
 
 
 # ── Section/chapter detection ────────────────────────────────────────────────
@@ -191,10 +207,7 @@ class _SectionMarker:
         self.key = key
 
 
-def _normalize_heading_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text or "")
-    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    return normalized.upper().strip()
+
 
 
 def _line_level_key(line: str) -> tuple[int, str] | None:
@@ -516,429 +529,40 @@ def _build_contextualized_text(chunk: LegalChunk, doc_id: str = "") -> str:
     return "\n".join(parts)
 
 
-def _build_pdf_page_context(blocks: list) -> dict[int, dict]:
-    """Build compact JSON-like page context from pdf_pipeline blocks."""
-    page_ctx: dict[int, dict] = {}
-    for block in blocks or []:
-        page = int(getattr(block, "page_number", 0) or 0)
-        if page <= 0:
-            continue
-        entry = page_ctx.setdefault(page, {"block_types": {}, "section_hints": {}})
-
-        btype = str(getattr(block, "block_type", "") or "").strip()
-        if btype:
-            bt = entry["block_types"]
-            bt[btype] = int(bt.get(btype, 0)) + 1
-
-        hint = str(getattr(block, "section_hint", "") or "").strip()
-        if hint:
-            sh = entry["section_hints"]
-            sh[hint] = int(sh.get(hint, 0)) + 1
-
-    compact: dict[int, dict] = {}
-    for page, data in page_ctx.items():
-        block_types = sorted(
-            data["block_types"].items(),
-            key=lambda x: (-x[1], x[0]),
-        )
-        section_hints = sorted(
-            data["section_hints"].items(),
-            key=lambda x: (-x[1], x[0]),
-        )
-        compact[page] = {
-            "block_types": [k for k, _ in block_types[:4]],
-            "section_hints": [k for k, _ in section_hints[:3]],
-        }
-    return compact
-
-
-def _enrich_with_pdf_json_context(
-    texts_for_embedding: list[str],
-    metadatas: list[dict],
-    pdf_blocks: list,
-) -> list[str]:
-    """Enrich embedding text and metadata with compact JSON structural context."""
-    if not texts_for_embedding or not metadatas or not pdf_blocks:
-        return texts_for_embedding
-
-    page_ctx = _build_pdf_page_context(pdf_blocks)
-    if not page_ctx:
-        return texts_for_embedding
-
-    enriched: list[str] = []
-    for text, meta in zip(texts_for_embedding, metadatas):
-        page = meta.get("page_number")
-        if page is None:
-            enriched.append(text)
-            continue
-
-        ctx = page_ctx.get(int(page))
-        if not ctx:
-            enriched.append(text)
-            continue
-
-        block_types = ctx.get("block_types", [])
-        section_hints = ctx.get("section_hints", [])
-
-        # Persist compact context for filtering/reranking.
-        if block_types:
-            meta["pdf_block_types"] = ",".join(block_types)
-        if section_hints:
-            meta["pdf_section_hints"] = " | ".join(section_hints)
-
-        prefix_parts: list[str] = [f"[Pagina: {page}]"]
-        if section_hints:
-            prefix_parts.append(f"[Secoes: {'; '.join(section_hints)}]")
-        if block_types:
-            prefix_parts.append(f"[Tipos: {', '.join(block_types)}]")
-        prefix = " ".join(prefix_parts)
-        enriched.append(f"{prefix}\n{text}")
-
-    return enriched
-
-
-def _parse_xlsx(path: Path) -> tuple[str, dict]:
-    """Parse XLSX/XLS into markdown-style text preserving table structure."""
-    import openpyxl
-
-    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-    parts: list[str] = []
-    sheet_count = len(wb.sheetnames)
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            continue
-
-        # Build markdown table per sheet
-        lines: list[str] = [f"## Planilha: {sheet_name}\n"]
-        header = rows[0]
-        col_names = [str(cell) if cell is not None else "" for cell in header]
-
-        # Markdown table header
-        lines.append("| " + " | ".join(col_names) + " |")
-        lines.append("| " + " | ".join("---" for _ in col_names) + " |")
-
-        # Data rows
-        for row in rows[1:]:
-            cells = [str(cell) if cell is not None else "" for cell in row]
-            # Skip completely empty rows
-            if not any(c.strip() for c in cells):
-                continue
-            lines.append("| " + " | ".join(cells) + " |")
-
-        parts.append("\n".join(lines))
-
-    wb.close()
-    text = "\n\n".join(parts)
-    return text, {"sheet_count": sheet_count}
-
-
-def _parse_csv(path: Path) -> tuple[str, dict]:
-    """Parse CSV into markdown-style text preserving table structure."""
-    import csv
-
-    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-        try:
-            with open(path, newline="", encoding=encoding) as f:
-                # Detect delimiter
-                sample = f.read(4096)
-                f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-                except csv.Error:
-                    dialect = csv.excel
-                reader = csv.reader(f, dialect)
-                rows = list(reader)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        raise ValueError("Unable to decode CSV file")
-
-    if not rows:
-        return "", {}
-
-    # Build markdown table
-    lines: list[str] = []
-    header = rows[0]
-    lines.append("| " + " | ".join(header) + " |")
-    lines.append("| " + " | ".join("---" for _ in header) + " |")
-
-    for row in rows[1:]:
-        # Pad or trim to match header length
-        cells = row + [""] * (len(header) - len(row))
-        cells = cells[: len(header)]
-        if not any(c.strip() for c in cells):
-            continue
-        lines.append("| " + " | ".join(cells) + " |")
-
-    return "\n".join(lines), {"row_count": len(rows) - 1}
-
-
-def _parse_docling_fast(path: Path) -> tuple[str, dict] | None:
-    """Try docling without OCR for editable PDFs. Returns None on failure.
-
-    Exports to markdown preserving headings, tables and document structure.
-    """
-    try:
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-
-        pdf_opts = PdfPipelineOptions()
-        pdf_opts.do_ocr = False
-        pdf_opts.do_table_structure = True
-
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
-            }
-        )
-        result = converter.convert(str(path))
-        text = result.document.export_to_markdown(
-            page_break_placeholder="<!-- PAGE_BREAK -->",
-        )
-        if len(text.strip()) < 200:
-            return None
-        page_count = len(result.pages) if hasattr(result, "pages") else None
-        meta: dict = {"parser": "docling"}
-        if page_count is not None:
-            meta["page_count"] = page_count
-        return text, meta
-    except Exception as exc:
-        log_event(logger, 30, "docling fast parse failed", path=str(path), error=str(exc))
-        return None
-
-
-def _has_line_structure(text: str) -> bool:
-    """Check if extracted text preserves structural markers at line starts.
-
-    Returns True if articles/sections appear at the beginning of lines,
-    which is required for legal chunking regexes to work.
-    """
-    normalized = _normalize_structural_headers(text)
-    art_count = len(_ARTIGO_RE.findall(normalized))
-    section_count = len(re.findall(r"^CAP[ÍI]TULO\s", text, re.IGNORECASE | re.MULTILINE))
-    return (art_count + section_count) >= 3
-
-
-def _parse_pdf(path: Path) -> tuple[str, dict]:
-    """Parse PDF with best available parser.
-
-    Strategy:
-    1. Try docling without OCR (markdown with headings)
-    2. Verify structural integrity (articles/sections at line starts)
-    3. If structure is broken -> PyMuPDF fallback (preserves line breaks)
-    4. If PyMuPDF extracts too little -> docling with OCR (scanned PDF)
-    """
-    # 1. Docling sem OCR — tenta markdown com headings
-    docling_result = _parse_docling_fast(path)
-    if docling_result is not None:
-        text, meta = docling_result
-        if _has_line_structure(text):
-            log_event(logger, 20, "PDF parsed with docling (markdown with headings)", path=str(path))
-            return docling_result
-        log_event(logger, 20, "Docling output lacks line structure, trying PyMuPDF",
-                  path=str(path))
-
-    # 2. PyMuPDF (preserva quebras de linha naturais do PDF)
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        # Se docling retornou algo, usar mesmo sem estrutura ideal
-        if docling_result is not None:
-            return docling_result
-        log_event(logger, 30, "PyMuPDF not available, falling back to docling+OCR", path=str(path))
-        return _parse_docling(path)
-
-    doc = fitz.open(str(path))
-    page_count = len(doc)
-    pages: list[str] = []
-
-    for page in doc:
-        text = page.get_text("text")
-        if text.strip():
-            pages.append(text.strip())
-
-    doc.close()
-
-    total_chars = sum(len(p) for p in pages)
-    if total_chars > 200:
-        log_event(logger, 20, "PDF parsed with PyMuPDF fallback (plain text)", path=str(path))
-        text = _PAGE_BREAK_MARKER.join(pages)
-        return text, {"page_count": page_count, "parser": "pymupdf"}
-
-    # 3. Ultimo recurso: docling com OCR (PDF escaneado)
-    log_event(logger, 20, "Both docling-fast and PyMuPDF extracted too little, using docling+OCR",
-              path=str(path), pymupdf_chars=total_chars)
-    return _parse_docling(path)
-
-
-def _parse_docling(path: Path) -> tuple[str, dict]:
-    """Parse PDF/DOCX/PPTX using docling with OCR enabled."""
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-
-    pdf_opts = PdfPipelineOptions()
-    pdf_opts.do_ocr = True
-    pdf_opts.do_table_structure = True
-
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts),
-        }
-    )
-    result = converter.convert(str(path))
-    text = result.document.export_to_markdown(
-        page_break_placeholder="<!-- PAGE_BREAK -->",
-    )
-    page_count = len(result.pages) if hasattr(result, "pages") else None
-    meta: dict = {"parser": "docling"}
-    if page_count is not None:
-        meta["page_count"] = page_count
-    return text, meta
-
-
-def _parse(source: str) -> tuple[str, dict]:
-    """Extract raw text from a file. Returns (text, metadata).
-
-    Metadata may include ``page_count`` for PDF/DOCX files.
-    For PDF/DOCX, page break markers are embedded in the text so that
-    ``_assign_page_numbers`` can map chunks to their source pages.
-    """
-    path = Path(source)
-    suffix = path.suffix.lower()
-
-    if suffix in {".txt", ".md"}:
-        for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-            try:
-                return path.read_text(encoding=encoding), {}
-            except UnicodeDecodeError:
-                continue
-        raise ValueError(f"Unable to decode text file: {suffix}")
-
-    if suffix in {".xlsx", ".xls"}:
-        return _parse_xlsx(path)
-
-    if suffix == ".csv":
-        return _parse_csv(path)
-
-    if suffix == ".pdf":
-        return _parse_pdf(path)
-
-    if suffix in {".docx", ".pptx"}:
-        return _parse_docling(path)
-
-    raise ValueError(f"Unsupported file type: {suffix}")
-
-
-def _assign_page_numbers(chunks: list[str], raw_text: str) -> list[int | None]:
-    """Map each chunk to its starting page number based on page break markers.
-
-    Returns a list of page numbers (1-indexed) or None if no markers are present.
-    """
-    # Find positions of all page break markers in raw text
-    marker_positions: list[int] = [m.start() for m in _PAGE_BREAK_RE.finditer(raw_text)]
-    if not marker_positions:
-        return [None] * len(chunks)
-
-    # Clean text (without markers) to find chunk positions
-    clean_text = _PAGE_BREAK_RE.sub("", raw_text)
-
-    # Build a mapping: character position in clean text -> page number
-    # Page 1 starts at position 0; each marker advances the page
-    page_boundaries: list[int] = []  # clean-text positions where a new page starts
-    offset_adjustment = 0
-    for pos in marker_positions:
-        clean_pos = pos - offset_adjustment
-        page_boundaries.append(clean_pos)
-        offset_adjustment += len("<!-- PAGE_BREAK -->")
-
-    def _page_for_position(pos: int) -> int:
-        """Return 1-indexed page number for a character position in clean text."""
-        page = 1
-        for boundary in page_boundaries:
-            if pos >= boundary:
-                page += 1
-            else:
-                break
-        return page
-
-    result: list[int | None] = []
-    for chunk in chunks:
-        idx = clean_text.find(chunk[:80])  # match first 80 chars for robustness
-        if idx >= 0:
-            result.append(_page_for_position(idx))
-        else:
-            result.append(None)
-    return result
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split Portuguese text into sentences, respecting common abbreviations."""
-    # Protect abbreviations by replacing their dots with a placeholder
-    protected = _ABBREVIATIONS.sub(lambda m: m.group(0).replace(".", _ABBREV_PLACEHOLDER), text)
-    # Split on sentence-ending punctuation followed by whitespace/newline
-    raw_sentences = re.split(r"(?<=[.!?;])\s+", protected)
-    # Restore dots in abbreviations
-    return [s.replace(_ABBREV_PLACEHOLDER, ".").strip() for s in raw_sentences if s.strip()]
-
-
-def _split(text: str, chunk_size: int = 512, chunk_overlap: int = 64) -> list[str]:
-    """Split text into overlapping chunks respecting sentence boundaries.
-
-    Sentences are greedily packed up to *chunk_size* characters.  Overlap is
-    achieved by keeping trailing sentences from the previous chunk that fit
-    within *chunk_overlap* characters.  If a single sentence exceeds
-    *chunk_size*, it falls back to a character-level split.
-    """
-    sentences = _split_sentences(text)
-    if not sentences:
-        return []
-
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for sent in sentences:
-        sent_len = len(sent)
-
-        # Sentence longer than chunk_size: flush current, then char-split
-        if sent_len > chunk_size:
-            if current:
-                chunks.append(" ".join(current))
-                current = []
-                current_len = 0
-            start = 0
-            while start < sent_len:
-                chunks.append(sent[start : start + chunk_size].strip())
-                start += chunk_size - chunk_overlap
-            continue
-
-        # Adding this sentence would exceed chunk_size
-        if current_len + sent_len + (1 if current else 0) > chunk_size:
-            chunks.append(" ".join(current))
-            # Overlap: keep trailing sentences that fit within chunk_overlap
-            overlap: list[str] = []
-            overlap_len = 0
-            for s in reversed(current):
-                if overlap_len + len(s) + (1 if overlap else 0) > chunk_overlap:
-                    break
-                overlap.insert(0, s)
-                overlap_len += len(s) + (1 if len(overlap) > 1 else 0)
-            current = overlap
-            current_len = sum(len(s) for s in current) + max(len(current) - 1, 0)
-
-        current.append(sent)
-        current_len += sent_len + (1 if len(current) > 1 else 0)
-
-    if current:
-        chunks.append(" ".join(current))
-
-    return [c for c in chunks if c]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class IngestionError(Exception):
@@ -1392,6 +1016,7 @@ def _ingest_tabular(
 ) -> tuple[list[str], list[str], list[dict]]:
     """Tabular ingestion path: structured row extraction + tabular chunks."""
     from src.tabular import chunk_tabular_records, extract_tables_from_text, extract_tables_pdfplumber
+    from src.table_semantics import infer_profiles_from_records, infer_table_type
 
     with metrics.time_block("ingestion.split_tabular"):
         if str(source).lower().endswith(".pdf"):
@@ -1420,10 +1045,15 @@ def _ingest_tabular(
                     collection=collection, doc_id=doc_id, error=str(exc),
                 )
 
+    inferred_profiles = infer_profiles_from_records(extraction.column_names, extraction.records)
+    inferred_table_type = infer_table_type(inferred_profiles)
+    chunk_group_size = 1 if inferred_table_type == "catalog" else settings.tabular_chunk_group_size
     chunked = chunk_tabular_records(
         extraction.records,
-        group_size=settings.tabular_chunk_group_size,
+        group_size=chunk_group_size,
         max_chunk_chars=settings.tabular_chunk_max_chars,
+        force_single_row=inferred_table_type == "catalog",
+        header_columns=extraction.column_names if inferred_table_type == "catalog" else None,
     )
     source_filename = os.path.basename(source)
     chunks: list[str] = []
@@ -1440,12 +1070,14 @@ def _ingest_tabular(
             "workspace_id": workspace_id,
             "embedding_model": model_name,
             "chunk_type": "tabular",
+            "table_type": inferred_table_type,
             "row_start": int(chunk_meta.get("row_start", i)),
             "row_end": int(chunk_meta.get("row_end", i)),
             "row_count": int(chunk_meta.get("row_count", 1)),
             "column_names": ",".join(extraction.column_names),
             "fields_json": json.dumps(chunk_meta.get("fields", {}), ensure_ascii=False),
             "raw_rows": "\n".join(chunk_meta.get("raw_rows", [])),
+            "header_columns": ",".join(chunk_meta.get("header_columns", [])),
         }
         if chunk_meta.get("page_number") is not None:
             meta["page_number"] = int(chunk_meta["page_number"])

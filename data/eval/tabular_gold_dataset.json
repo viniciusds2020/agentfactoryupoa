@@ -31,15 +31,24 @@
         {"name": "descricao_unimed_poa", "role": "text", "semantic_type": "catalog_title", "unit": "text", "aliases": ["descricao", "descricao unimed poa", "titulo"]},
         {"name": "cobertura_unimed_poa", "role": "text", "semantic_type": "coverage_rule", "unit": "text", "aliases": ["cobertura", "cobertura unimed poa"]},
         {"name": "segmentacao_ans", "role": "text", "semantic_type": "catalog_attribute", "unit": "text", "aliases": ["segmentacao", "segmentacao ans"]},
-        {"name": "emergencia", "role": "text", "semantic_type": "catalog_attribute", "unit": "text", "aliases": ["emergencia"]},
+        {"name": "emergencia", "role": "dimension", "semantic_type": "flag_boolean", "unit": "boolean", "aliases": ["emergencia", "urgencia"]},
         {"name": "prazo_autorizacao", "role": "text", "semantic_type": "deadline_rule", "unit": "text", "aliases": ["prazo", "prazo autorizacao"]},
-        {"name": "orientacao_autorizacao", "role": "text", "semantic_type": "authorization_rule", "unit": "text", "aliases": ["autorizacao", "orientacao autorizacao"]}
+        {"name": "orientacao_autorizacao", "role": "text", "semantic_type": "authorization_rule", "unit": "text", "aliases": ["autorizacao", "orientacao autorizacao"]},
+        {"name": "prazo_dias", "role": "metric", "semantic_type": "measure_integer", "unit": "dias", "aliases": ["prazo dias"]},
+        {"name": "prazo_faixa", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["faixa de prazo", "prazo faixa"]},
+        {"name": "prazo_urgencia", "role": "dimension", "semantic_type": "dimension_category", "unit": "text", "aliases": ["prazo urgencia", "urgencia do prazo"]},
+        {"name": "requer_autorizacao", "role": "dimension", "semantic_type": "flag_boolean", "unit": "boolean", "aliases": ["requer autorizacao", "autorizacao obrigatoria"]}
       ],
       "cases": [
         {"question": "Qual e o procedimento com esse id 20017?", "expected_intent": "catalog_lookup_by_id"},
         {"question": "Qual e o codigo da Visita Domiciliar?", "expected_intent": "catalog_lookup_by_title"},
         {"question": "Qual a cobertura do 20017?", "expected_intent": "catalog_field_lookup"},
         {"question": "Qual o prazo de autorizacao do 20017?", "expected_intent": "catalog_field_lookup"},
+        {"question": "Quais procedimentos sao de emergencia?", "expected_intent": "catalog_filter"},
+        {"question": "Quais procedimentos precisam de autorizacao?", "expected_intent": "catalog_filter"},
+        {"question": "Quais procedimentos tem cobertura?", "expected_intent": "catalog_filter"},
+        {"question": "Quais procedimentos tem prazo maior que 5 dias?", "expected_intent": "catalog_deadline_report"},
+        {"question": "Alertas de SLA", "expected_intent": "catalog_sla_alert"},
         {"question": "Resuma o procedimento 20017", "expected_intent": "catalog_record_summary"},
         {"question": "Compare 10049 e 20017", "expected_intent": "catalog_compare"}
       ]

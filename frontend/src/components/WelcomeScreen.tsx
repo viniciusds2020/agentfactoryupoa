@@ -1,8 +1,19 @@
 export default function WelcomeScreen({
   collection,
+  mode,
+  onSuggestionClick,
 }: {
   collection: string
+  mode?: 'general' | 'legal' | 'tabular'
+  onSuggestionClick?: (question: string) => void
 }) {
+  const tabularSuggestions = [
+    'Qual a cobertura do procedimento 10049?',
+    'Quais procedimentos sao de emergencia?',
+    'Quais procedimentos tem prazo maior que 5 dias?',
+    'Relatorio de prazos',
+    'Alertas de SLA',
+  ]
   return (
     <div className="empty-state">
       <div className="empty-glow" />
@@ -26,6 +37,28 @@ export default function WelcomeScreen({
           Ouro. Depois, volte aqui para consultar.
         </div>
       </div>
+
+      {mode === 'tabular' && (
+        <div className="empty-upload glass-panel" style={{ marginTop: 16 }}>
+          <div className="empty-upload-title">Sugestoes para catalogos e tabelas</div>
+          <div className="empty-upload-subtitle">
+            Clique em uma pergunta para testar a base rapidamente.
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 12 }}>
+            {tabularSuggestions.map((question) => (
+              <button
+                key={question}
+                type="button"
+                className="top-badge"
+                style={{ cursor: 'pointer' }}
+                onClick={() => onSuggestionClick?.(question)}
+              >
+                {question}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
