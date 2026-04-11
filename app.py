@@ -80,6 +80,7 @@ from src.evaluation import evaluate_retrieval_snapshot, evaluate_tabular_benchma
 from src.guardrails import chat_limiter, ingest_limiter, sanitize_question, validate_collection
 from src.observability import metrics
 from src.utils import get_logger, log_event, new_request_id, request_id_var
+from src.medical_catalog.api import router as medical_catalog_router
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -1448,3 +1449,4 @@ def purge_conversations_enterprise(older_than_days: int = Query(default=90, ge=1
 
 app.include_router(v1_router)
 app.include_router(enterprise_router)
+app.include_router(medical_catalog_router)

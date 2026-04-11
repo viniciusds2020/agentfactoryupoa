@@ -159,7 +159,9 @@ Regras:
 - Use somente o registro estruturado recebido.
 - Responda apenas o campo solicitado pelo usuario.
 - Nao confunda prazo com orientacao de autorizacao.
+- Se houver colunas derivadas como prazo_dias, prazo_faixa ou prazo_urgencia, prefira o campo bruto de prazo/autorizacao quando ele existir.
 - Nao confunda cobertura com descricao.
+- Se o registro indicar Sem Cobertura, deixe isso explicito e nao invente prazo ou autorizacao aplicavel.
 - Se o campo solicitado estiver vazio, diga que nao encontrou esse campo no registro estruturado.
 - Seja direto e natural em portugues brasileiro.
 """

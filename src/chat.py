@@ -1136,12 +1136,84 @@ def _artifact_candidates(doc_id: str, filename: str) -> list[str]:
 
 
 def _resolve_processed_json(doc_id: str, filename: str) -> Path | None:
-    artifacts_dir = Path(get_settings().pdf_pipeline_artifacts_dir)
+    settings = get_settings()
+    artifacts_dir = Path(getattr(settings, "pdf_pipeline_artifacts_dir", "data/processed"))
     for key in _artifact_candidates(doc_id, filename):
         path = artifacts_dir / f"{key}.json"
         if path.exists():
             return path
     return None
+
+
+def _resolve_processed_tabular_json(doc_id: str, filename: str) -> Path | None:
+    settings = get_settings()
+    artifacts_dir = Path(getattr(settings, "pdf_pipeline_artifacts_dir", "data/processed"))
+    for key in _artifact_candidates(doc_id, filename):
+        path = artifacts_dir / f"{key}.tabular.json"
+        if path.exists():
+            return path
+    return None
+
+
+def _build_tabular_artifact_from_processed_json(doc, profiles: list[dict]) -> Path | None:
+    processed = _resolve_processed_json(doc.doc_id, doc.filename)
+    if not processed:
+        return None
+    try:
+        payload = json.loads(processed.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    blocks = [
+        {
+            "text": str(block.get("text", "")).strip(),
+            "page_number": block.get("page_number"),
+        }
+        for block in payload.get("blocks", []) or []
+        if str(block.get("text", "")).strip()
+    ]
+    records: list[dict] = []
+    seen_codes: set[str] = set()
+    for idx, block in enumerate(blocks):
+        text = str(block.get("text", "")).strip()
+        if not _looks_like_catalog_record_start(text):
+            continue
+        code_match = re.search(r"\b(\d{5,})\b", text)
+        if not code_match:
+            continue
+        code = code_match.group(1)
+        if code in seen_codes:
+            continue
+        record = _extract_catalog_record_from_blocks(blocks, idx, code, profiles=profiles)
+        if len(record) <= 1:
+            continue
+        seen_codes.add(code)
+        records.append(
+            {
+                "row_index": len(records),
+                "page_number": block.get("page_number"),
+                "fields": record,
+                "texto_canonico": "; ".join(f"{k}: {v}" for k, v in record.items() if str(v).strip()),
+                "raw_row": text,
+            }
+        )
+    if not records:
+        return None
+    artifact_path = processed.with_suffix(processed.suffix.replace(".json", ".tabular.json"))
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "doc_id": doc.doc_id,
+                "collection": "",
+                "table_type": "catalog",
+                "column_names": list(dict.fromkeys(k for record in records for k in record["fields"].keys())),
+                "records": records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return artifact_path
 
 
 def _extract_catalog_code(question: str) -> str:
@@ -1175,7 +1247,6 @@ def _catalog_field_request(question: str, workspace_id: str, collection: str) ->
             r"\bdescri",
             r"\bnome\b",
             r"\btitulo\b",
-            r"\bprocedimento\b",
         ],
     }
     fallback_tokens = {
@@ -1204,17 +1275,41 @@ def _catalog_field_request(question: str, workspace_id: str, collection: str) ->
         if not name:
             continue
         score = 0
+        name_norm = _normalize_for_match(name.replace("_", " "))
+        effective_semantic_type = semantic_type
+        if semantic_type == "authorization_rule" and "prazo" in name_norm and "prazo" in q_norm:
+            effective_semantic_type = "deadline_rule"
         for pattern in semantic_patterns.get(semantic_type, []):
             if re.search(pattern, q_norm):
                 score += 10
         for alias in aliases:
             if alias and re.search(rf"\b{re.escape(alias)}\b", q_norm):
                 score += max(3, min(len(alias.split()), 4))
+        if effective_semantic_type == "deadline_rule":
+            if "prazo" in q_norm and "prazo" in name_norm:
+                score += 8
+            if "autoriz" in q_norm and "autoriz" in name_norm:
+                score += 8
+            if "autoriz" in q_norm and "autoriz" not in name_norm:
+                score -= 4
+            if "urgencia" in name_norm and "urgencia" not in q_norm:
+                score -= 6
+            if "faixa" in name_norm and "faixa" not in q_norm:
+                score -= 4
+            if "dias" in name_norm and "dias" not in q_norm and "prazo" in q_norm:
+                score -= 3
+        if effective_semantic_type == "authorization_rule":
+            if "prazo" in q_norm and "prazo" in name_norm:
+                score += 12
+            if "autoriz" in q_norm and "autoriz" in name_norm:
+                score += 8
+            if "orientacao" in name_norm and "orient" not in q_norm and "como" not in q_norm:
+                score -= 3
         if score <= 0:
             continue
-        label = aliases[0] if aliases else name.replace("_", " ")
-        priority = semantic_priority.index(semantic_type)
-        candidates.append((score, -priority, name, semantic_type, label))
+        label = "prazo de autorizacao" if effective_semantic_type == "deadline_rule" and "prazo" in name_norm else (aliases[0] if aliases else name.replace("_", " "))
+        priority = semantic_priority.index(effective_semantic_type)
+        candidates.append((score, -priority, name, effective_semantic_type, label))
 
     if candidates:
         candidates.sort(reverse=True)
@@ -1263,45 +1358,53 @@ def _catalog_profiles(workspace_id: str, collection: str) -> list[dict]:
 def _catalog_header_order(blocks: list[dict], start_idx: int, profiles: list[dict]) -> list[dict]:
     if not profiles:
         return []
-    search_start = max(0, start_idx - 120)
-    best_matches: list[tuple[int, dict]] = []
-    best_key: tuple[int, int] | None = None
-    for idx in range(search_start, start_idx + 1):
-        text_parts: list[str] = []
-        consumed = 0
-        probe = idx
-        while probe <= start_idx and consumed < 5:
-            raw = str(blocks[probe].get("text", "")).strip()
-            if not raw:
+    def _search_header_range(range_start: int, range_end: int) -> list[dict]:
+        best_matches: list[tuple[int, dict]] = []
+        best_key: tuple[int, int] | None = None
+        for idx in range(range_start, range_end + 1):
+            text_parts: list[str] = []
+            consumed = 0
+            probe = idx
+            while probe <= start_idx and consumed < 5:
+                raw = str(blocks[probe].get("text", "")).strip()
+                if not raw:
+                    probe += 1
+                    consumed += 1
+                    continue
+                if probe > idx and _looks_like_catalog_record_start(raw):
+                    break
+                text_parts.append(raw.replace("\n", " "))
                 probe += 1
                 consumed += 1
+            joined_text = " ".join(text_parts)
+            if not _catalog_block_is_headerish(joined_text, profiles):
                 continue
-            if probe > idx and _looks_like_catalog_record_start(raw):
-                break
-            text_parts.append(raw.replace("\n", " "))
-            probe += 1
-            consumed += 1
-        text = _normalize_for_match(" ".join(text_parts))
-        local_matches: list[tuple[int, dict]] = []
-        for profile in profiles:
-            best_pos = None
-            for alias in profile.get("aliases", []) or []:
-                if not alias:
-                    continue
-                pos = text.find(_normalize_for_match(alias))
-                if pos >= 0 and (best_pos is None or pos < best_pos):
-                    best_pos = pos
-            if best_pos is not None:
-                local_matches.append((best_pos, profile))
-        candidate_key = (len(local_matches), idx)
-        if local_matches and (
-            best_key is None
-            or candidate_key[0] > best_key[0]
-            or (candidate_key[0] == best_key[0] and candidate_key[1] > best_key[1])
-        ):
-            best_matches = sorted(local_matches, key=lambda item: item[0])
-            best_key = candidate_key
-    return [profile for _, profile in best_matches]
+            text = _normalize_for_match(joined_text)
+            local_matches: list[tuple[int, dict]] = []
+            for profile in profiles:
+                best_pos = None
+                for alias in profile.get("aliases", []) or []:
+                    if not alias:
+                        continue
+                    pos = text.find(_normalize_for_match(alias))
+                    if pos >= 0 and (best_pos is None or pos < best_pos):
+                        best_pos = pos
+                if best_pos is not None:
+                    local_matches.append((best_pos, profile))
+            candidate_key = (len(local_matches), idx)
+            if local_matches and (
+                best_key is None
+                or candidate_key[0] > best_key[0]
+                or (candidate_key[0] == best_key[0] and candidate_key[1] > best_key[1])
+            ):
+                best_matches = sorted(local_matches, key=lambda item: item[0])
+                best_key = candidate_key
+        return [profile for _, profile in best_matches]
+
+    local = _search_header_range(max(0, start_idx - 120), start_idx)
+    if local:
+        return local
+    return _search_header_range(0, start_idx)
 
 
 def _looks_like_catalog_record_start(text: str) -> bool:
@@ -1330,6 +1433,45 @@ def _catalog_block_is_headerish(text: str, profiles: list[dict]) -> bool:
     return hits >= 3
 
 
+def _catalog_effective_semantic_type(profile: dict) -> str:
+    semantic_type = str(profile.get("semantic_type", "")).strip()
+    name_norm = _normalize_for_match(str(profile.get("name", "")).replace("_", " "))
+    if "prazo" in name_norm:
+        return "deadline_rule"
+    if ("autoriz" in name_norm or "requer" in name_norm) and "prazo" not in name_norm:
+        return "authorization_rule"
+    if "cobertura" in name_norm:
+        return "coverage_rule"
+    if "segmentacao" in name_norm:
+        return "catalog_attribute"
+    if "emergencia" in name_norm or "urgencia" in name_norm:
+        return "flag_boolean"
+    return semantic_type
+
+
+def _catalog_default_profile_order(profiles: list[dict]) -> list[dict]:
+    def sort_key(profile: dict) -> tuple[int, str]:
+        name = str(profile.get("name", "")).strip()
+        effective = _catalog_effective_semantic_type(profile)
+        if str(profile.get("role", "")).strip() == "identifier" or effective == "identifier":
+            return (0, name)
+        if effective == "catalog_title":
+            return (1, name)
+        if effective == "coverage_rule":
+            return (2, name)
+        if effective == "catalog_attribute":
+            return (3, name)
+        if effective == "flag_boolean":
+            return (4, name)
+        if effective == "deadline_rule":
+            return (5, name)
+        if effective == "authorization_rule":
+            return (6, name)
+        return (7, name)
+
+    return sorted(profiles, key=sort_key)
+
+
 def _catalog_record_end_index(blocks: list[dict], start_idx: int) -> int:
     idx = start_idx + 1
     while idx < len(blocks):
@@ -1344,7 +1486,13 @@ def _extract_catalog_record_from_blocks(blocks: list[dict], start_idx: int, code
     profiles = profiles or []
     identifier_profile = next((profile for profile in profiles if profile.get("role") == "identifier"), None)
     title_profile = next((profile for profile in profiles if profile.get("semantic_type") == "catalog_title"), None)
-    auth_profile = next((profile for profile in profiles if profile.get("semantic_type") == "authorization_rule"), None)
+    auth_profile = next(
+        (
+            profile for profile in _catalog_default_profile_order(profiles)
+            if _catalog_effective_semantic_type(profile) == "authorization_rule"
+        ),
+        None,
+    )
     identifier_key = str(identifier_profile.get("name") if identifier_profile else "procedimento")
     title_key = str(title_profile.get("name") if title_profile else "descricao_unimed_poa")
     auth_key = str(
@@ -1357,9 +1505,24 @@ def _extract_catalog_record_from_blocks(blocks: list[dict], start_idx: int, code
     end_idx = _catalog_record_end_index(blocks, start_idx)
     start_text = str(blocks[start_idx].get("text", "")).strip()
     if start_text:
-        trimmed_start = re.sub(rf"^\s*{re.escape(code)}\s*", "", start_text).strip(" -:/|")
-        if trimmed_start:
-            description_parts.append(trimmed_start)
+        start_lines = _split_non_empty_lines(start_text)
+        if start_lines:
+            first_line = start_lines[0]
+            if re.search(rf"\b{re.escape(code)}\b", first_line):
+                start_lines = start_lines[1:]
+        for idx_line, line in enumerate(start_lines):
+            lower_line = _normalize_for_match(line)
+            is_field_like = (
+                "autoriz" in lower_line
+                or any(
+                    token in lower_line
+                    for token in ("sem cobertura", "hospitalar", "ambulatorial", "regulamentados", "nao", "sim", "uteis", "imediato")
+                )
+            )
+            if idx_line == 0 and not is_field_like:
+                description_parts.append(line)
+            else:
+                field_lines.append(line)
 
     idx = start_idx + 1
     while idx < end_idx:
@@ -1419,11 +1582,21 @@ def _extract_catalog_record_from_blocks(blocks: list[dict], start_idx: int, code
         ):
             non_auth_lines = [f"{non_auth_lines[0]} {non_auth_lines[1]}"] + non_auth_lines[2:]
 
-    ordered_profiles = _catalog_header_order(blocks, start_idx, profiles) or profiles
+    if len(non_auth_lines) >= 3:
+        second_norm = _normalize_for_match(non_auth_lines[1])
+        third_norm = _normalize_for_match(non_auth_lines[2])
+        if second_norm.endswith(" e") and any(token in third_norm for token in ("ambulatorial", "hospitalar")):
+            non_auth_lines = [
+                non_auth_lines[0],
+                f"{non_auth_lines[1]} {non_auth_lines[2]}".replace("  ", " ").strip(),
+                *non_auth_lines[3:],
+            ]
+
+    ordered_profiles = _catalog_default_profile_order(profiles)
     ordered_non_auth_profiles = [
         profile for profile in ordered_profiles
-        if profile.get("role") != "identifier"
-        and profile.get("semantic_type") not in {"catalog_title", "authorization_rule"}
+        if str(profile.get("role", "")).strip() != "identifier"
+        and _catalog_effective_semantic_type(profile) not in {"identifier", "catalog_title", "authorization_rule"}
     ]
     if non_auth_lines and ordered_non_auth_profiles:
         for idx, profile in enumerate(ordered_non_auth_profiles):
@@ -1444,13 +1617,153 @@ def _extract_catalog_record_from_blocks(blocks: list[dict], start_idx: int, code
     if auth_lines:
         record[auth_key] = " ".join(auth_lines)
 
+    return _backfill_catalog_record_fields(record)
+
+
+def _backfill_catalog_record_fields(record: dict[str, str]) -> dict[str, str]:
+    coverage = str(record.get("cobertura_unimed_poa", "") or record.get("cobertura", "")).strip()
+    segmentation = str(record.get("segmentacao_ans", "") or record.get("segmentacao", "")).strip()
+    emergency = str(record.get("emergencia", "")).strip()
+    deadline_keys = [
+        "prazo_autorizacao_conforme_rn_no_623_ans",
+        "prazo_autorizacao_conforme_rn_n_623_ans",
+        "prazo_autorizacao",
+        "prazo",
+        "prazo_dias",
+        "prazo_faixa",
+        "prazo_urgencia",
+    ]
+    composite_key = next((key for key in deadline_keys if str(record.get(key, "")).strip()), "")
+    composite_value = str(record.get(composite_key, "")).strip()
+    emergency_value = str(record.get("emergencia", "")).strip()
+    if not composite_value and emergency_value:
+        composite_value = emergency_value
+
+    if not composite_value:
+        return record
+
+    normalized_value = _normalize_for_match(composite_value)
+    coverage_tokens = ("ambulatorial", "hospitalar", "sem cobertura", "ambas")
+    emergency_tokens = {"nao", "não", "sim"}
+
+    extracted_coverage = ""
+    extracted_segmentation = ""
+    extracted_emergency = ""
+    extracted_deadline = ""
+
+    if not coverage or not emergency:
+        token_parts = re.split(r"\s+", composite_value)
+        if token_parts:
+            first_two = " ".join(token_parts[:2]).strip()
+            first_one = token_parts[0].strip()
+            if not coverage:
+                if _normalize_for_match(first_two) == "sem cobertura":
+                    extracted_coverage = "Sem Cobertura"
+                elif _normalize_for_match(first_one) in coverage_tokens:
+                    extracted_coverage = first_one
+            if not emergency:
+                for idx, token in enumerate(token_parts):
+                    token_norm = _normalize_for_match(token)
+                    if token_norm in emergency_tokens:
+                        extracted_emergency = "NÃO" if token_norm in {"nao", "não"} else token.upper()
+                        remainder = " ".join(token_parts[idx + 1 :]).strip()
+                        if remainder:
+                            extracted_deadline = remainder
+                        break
+
+    if not coverage and extracted_coverage:
+        if not segmentation and _normalize_for_match(str(record.get("segmentacao_ans", ""))) not in coverage_tokens:
+            record["cobertura_unimed_poa"] = segmentation or extracted_coverage
+            if segmentation:
+                record["segmentacao_ans"] = extracted_coverage
+        else:
+            record["cobertura_unimed_poa"] = extracted_coverage
+
+    if not emergency and extracted_emergency:
+        record["emergencia"] = extracted_emergency
+
+    if extracted_deadline:
+        record["prazo_autorizacao_conforme_rn_no_623_ans"] = extracted_deadline
+        record["prazo_autorizacao"] = extracted_deadline
+
+    if emergency_value:
+        token_parts = re.split(r"\s+", emergency_value)
+        for idx, token in enumerate(token_parts):
+            token_norm = _normalize_for_match(token)
+            if token_norm in emergency_tokens:
+                before = " ".join(token_parts[:idx]).strip()
+                after = " ".join(token_parts[idx + 1 :]).strip()
+                if before and not segmentation:
+                    extracted_segmentation = before
+                if token_norm in {"nao", "não"}:
+                    record["emergencia"] = "NÃO"
+                else:
+                    record["emergencia"] = token.upper()
+                if after and not extracted_deadline:
+                    extracted_deadline = after
+                break
+
+    if extracted_segmentation and not segmentation:
+        record["segmentacao_ans"] = extracted_segmentation
+    if extracted_deadline:
+        record["prazo_autorizacao_conforme_rn_no_623_ans"] = extracted_deadline
+        record["prazo_autorizacao"] = extracted_deadline
+
+    prazo_base = str(
+        record.get("prazo_autorizacao_conforme_rn_no_623_ans", "")
+        or record.get("prazo_autorizacao_conforme_rn_n_623_ans", "")
+        or record.get("prazo_autorizacao", "")
+        or record.get("prazo", "")
+    ).strip()
+    prazo_dias = str(record.get("prazo_dias", "")).strip()
+    if prazo_base and prazo_dias:
+        base_norm = _normalize_for_match(prazo_base)
+        dias_norm = _normalize_for_match(prazo_dias)
+        if (
+            any(token in base_norm for token in ("terapia", "consultas", "sessoes", "sessões", "atendimento"))
+            and any(token in dias_norm for token in ("dia", "dias", "uteis", "úteis", "horas"))
+            and dias_norm not in base_norm
+        ):
+            combined = f"{prazo_base} {prazo_dias}".strip()
+            record["prazo_autorizacao_conforme_rn_no_623_ans"] = combined
+            record["prazo_autorizacao"] = combined
+
+    if not coverage and "sem cobertura" in normalized_value:
+        record["cobertura_unimed_poa"] = "Sem Cobertura"
+
     return record
+
+
+def _catalog_code_match_score(text: str, code: str) -> int:
+    raw = str(text or "").strip()
+    if not raw:
+        return 0
+    normalized = re.sub(r"\s+", " ", raw)
+    if re.fullmatch(rf"{re.escape(code)}", normalized):
+        return 100
+    if re.match(rf"^{re.escape(code)}(?:\b|\s|[-/:|])", normalized):
+        return 80
+    if re.search(rf"\b{re.escape(code)}\b", normalized):
+        return 50
+    return 0
 
 
 def _artifact_catalog_field_value(record: dict[str, str], semantic_type: str, fallback_column: str) -> tuple[str, str] | None:
     candidates_by_semantic = {
-        "deadline_rule": ["prazo_autorizacao_conforme_rn_n_623_ans", "prazo_autorizacao", "prazo"],
-        "authorization_rule": ["orientacao_autorizacao_call_center", "orientacao_autorizacao", "autorizacao"],
+        "deadline_rule": [
+            "prazo_autorizacao_conforme_rn_no_623_ans",
+            "prazo_autorizacao_conforme_rn_n_623_ans",
+            "prazo_autorizacao",
+            "prazo",
+            "prazo_dias",
+            "prazo_faixa",
+        ],
+        "authorization_rule": [
+            "orientacao_autorizacao_call_center",
+            "orientacao_autorizacao",
+            "requer_autorizacao",
+            "autorizacao",
+        ],
         "coverage_rule": ["cobertura_unimed_poa", "cobertura"],
         "flag_boolean": ["emergencia", "urgencia"],
         "catalog_title": ["descricao_unimed_poa", "descricao", "titulo", "title"],
@@ -1462,7 +1775,116 @@ def _artifact_catalog_field_value(record: dict[str, str], semantic_type: str, fa
     value = str(record.get(fallback_column, "")).strip()
     if value:
         return fallback_column, value
+    normalized_record = {str(key).strip().lower(): str(value).strip() for key, value in record.items() if str(value).strip()}
+    if semantic_type == "deadline_rule":
+        for key, value in normalized_record.items():
+            if "prazo" in key and "autoriz" in key:
+                return key, value
+        for key, value in normalized_record.items():
+            if key.startswith("prazo_") and "urgencia" not in key:
+                return key, value
+    if semantic_type == "authorization_rule":
+        for key, value in normalized_record.items():
+            if "autoriz" in key and "prazo" not in key:
+                return key, value
     return None
+
+
+def _artifact_catalog_field_value_is_usable(column_name: str, value: str, semantic_type: str) -> bool:
+    key_norm = _normalize_for_match(column_name)
+    value_norm = _normalize_for_match(value)
+    if not value_norm:
+        return False
+    if semantic_type == "deadline_rule":
+        if value_norm == "sem cobertura":
+            return False
+        deadline_tokens = ("dia", "dias", "uteis", "imediato", "horas", "consultas", "sessoes", "sessoes", "sem cobertura")
+        if "prazo" in key_norm and any(token in value_norm for token in deadline_tokens):
+            return True
+        return any(token in value_norm for token in deadline_tokens)
+    if semantic_type == "authorization_rule":
+        if value_norm == "sem cobertura":
+            return False
+        auth_tokens = ("autoriz", "liber", "sem cobertura")
+        if ("autoriz" in key_norm or "requer" in key_norm) and any(token in value_norm for token in auth_tokens):
+            return True
+        return any(token in value_norm for token in auth_tokens)
+    if semantic_type == "coverage_rule":
+        return "cobertura" in key_norm or "cobertura" in value_norm
+    return True
+
+
+def _catalog_field_unavailable_answer(
+    *,
+    code: str,
+    title: str,
+    semantic_type: str,
+    label: str,
+    record: dict[str, str],
+) -> str:
+    coverage = str(record.get("cobertura_unimed_poa", "") or record.get("cobertura", "")).strip()
+    coverage_norm = _normalize_for_match(coverage)
+    if not coverage_norm:
+        for value in record.values():
+            value_norm = _normalize_for_match(str(value))
+            if value_norm == "sem cobertura":
+                coverage_norm = value_norm
+                break
+    has_no_coverage = "sem cobertura" in coverage_norm
+    if semantic_type == "deadline_rule" and has_no_coverage:
+        return (
+            f"O procedimento {code} ({title}) está marcado como Sem Cobertura, "
+            "então não há prazo de autorização aplicável informado neste registro."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
+    if semantic_type == "authorization_rule" and has_no_coverage:
+        return (
+            f"O procedimento {code} ({title}) está marcado como Sem Cobertura, "
+            "então não há prazo ou orientação de autorização aplicável informada neste registro."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
+    return (
+        f"Encontrei o procedimento {code} ({title}), mas não localizei o campo {label} com segurança no artefato processado."
+        + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+    )
+
+
+def _catalog_record_context_suffix(record: dict[str, str], semantic_type: str | None = None) -> str:
+    description = str(
+        record.get("descricao_unimed_poa", "")
+        or record.get("descricao", "")
+        or record.get("titulo", "")
+        or record.get("title", "")
+    ).strip()
+    coverage = str(record.get("cobertura_unimed_poa", "") or record.get("cobertura", "")).strip()
+    segmentation = str(record.get("segmentacao_ans", "") or record.get("segmentacao", "")).strip()
+    emergency = str(record.get("emergencia", "") or record.get("urgencia", "")).strip()
+    deadline = (
+        str(record.get("prazo_autorizacao_conforme_rn_no_623_ans", "") or record.get("prazo_autorizacao_conforme_rn_n_623_ans", "")).strip()
+        or str(record.get("prazo_autorizacao", "")).strip()
+        or str(record.get("prazo", "")).strip()
+    )
+    authorization = (
+        str(record.get("orientacao_autorizacao_call_center", "") or record.get("orientacao_autorizacao", "")).strip()
+        or str(record.get("requer_autorizacao", "")).strip()
+        or str(record.get("autorizacao", "")).strip()
+    )
+    parts: list[str] = []
+    if description:
+        parts.append(f"Descrição: {description}")
+    if coverage:
+        parts.append(f"Cobertura: {coverage}")
+    if segmentation:
+        parts.append(f"Segmentação: {segmentation}")
+    if emergency:
+        parts.append(f"Emergência: {emergency}")
+    if deadline and semantic_type != "deadline_rule":
+        parts.append(f"Prazo: {deadline}")
+    if authorization and semantic_type != "authorization_rule":
+        parts.append(f"Autorização: {authorization}")
+    if not parts:
+        return ""
+    return " Campos relacionados: " + "; ".join(parts) + "."
 
 
 def _deterministic_catalog_field_answer(
@@ -1472,21 +1894,43 @@ def _deterministic_catalog_field_answer(
     semantic_type: str,
     label: str,
     value: str,
+    record: dict[str, str],
 ) -> str:
     if semantic_type == "deadline_rule":
-        return f"O prazo de autorizacao do procedimento {code} ({title}) e: {value}."
+        return (
+            f"O prazo de autorização do procedimento {code} ({title}) é: {value}."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
     if semantic_type == "authorization_rule":
-        return f"A orientacao de autorizacao do procedimento {code} ({title}) e: {value}."
+        return (
+            f"A orientação de autorização do procedimento {code} ({title}) é: {value}."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
     if semantic_type == "coverage_rule":
-        return f"A cobertura do procedimento {code} ({title}) e: {value}."
+        return (
+            f"A cobertura do procedimento {code} ({title}) é: {value}."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
     if semantic_type == "flag_boolean":
         normalized_value = _normalize_for_match(value)
         if normalized_value in {"sim", "s"}:
-            return f"O procedimento {code} ({title}) e classificado como emergencia."
+            return (
+                f"O procedimento {code} ({title}) é classificado como emergência."
+                + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+            )
         if normalized_value in {"nao", "n"}:
-            return f"O procedimento {code} ({title}) nao e classificado como emergencia."
-        return f"A informacao de emergencia do procedimento {code} ({title}) e: {value}."
-    return f"O campo {label} do procedimento {code} ({title}) e: {value}."
+            return (
+                f"O procedimento {code} ({title}) não é classificado como emergência."
+                + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+            )
+        return (
+            f"A informação de emergência do procedimento {code} ({title}) é: {value}."
+            + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+        )
+    return (
+        f"O campo {label} do procedimento {code} ({title}) é: {value}."
+        + _catalog_record_context_suffix(record, semantic_type=semantic_type)
+    )
 
 
 def _catalog_prompt_answer_is_usable(
@@ -1517,6 +1961,190 @@ def _catalog_prompt_answer_is_usable(
     return all(token in normalized for token in required_tokens)
 
 
+def _title_from_catalog_record(record: dict[str, str], profiles: list[dict]) -> str:
+    for candidate in [p.get("name") for p in profiles if p.get("semantic_type") == "catalog_title"] + ["descricao_unimed_poa", "descricao", "titulo", "title", "nome"]:
+        if not candidate:
+            continue
+        description = str(record.get(str(candidate), "")).strip()
+        if description:
+            return description
+    return ""
+
+
+def _chat_result_from_catalog_record(
+    *,
+    doc,
+    code: str,
+    question: str,
+    request_id: str,
+    profiles: list[dict],
+    record: dict[str, str],
+    page_number: int | None,
+    source_excerpt: str,
+    requested_field: tuple[str, str, str] | None,
+) -> ChatResult:
+    description = _title_from_catalog_record(record, profiles)
+    if requested_field:
+        target_column, semantic_type, label = requested_field
+        field_value = _artifact_catalog_field_value(record, semantic_type, target_column)
+        if field_value:
+            resolved_column, value = field_value
+            if _artifact_catalog_field_value_is_usable(resolved_column, value, semantic_type):
+                title = description or f"codigo {code}"
+                deterministic_answer = _deterministic_catalog_field_answer(
+                    code=code,
+                    title=title,
+                    semantic_type=semantic_type,
+                    label=label,
+                    value=value,
+                    record=record,
+                )
+                answer = deterministic_answer
+                try:
+                    record_json = json.dumps(record, ensure_ascii=False, indent=2)
+                    prompt_messages = build_catalog_record_messages(
+                        question=question,
+                        target_column=resolved_column,
+                        field_label=label,
+                        record_json=record_json,
+                    )
+                    prompted_answer = llm.chat(
+                        prompt_messages,
+                        system=get_catalog_record_system(),
+                    ).strip()
+                    if _catalog_prompt_answer_is_usable(
+                        answer=prompted_answer,
+                        code=code,
+                        title=title,
+                        semantic_type=semantic_type,
+                        value=value,
+                    ):
+                        answer = prompted_answer
+                except Exception:
+                    answer = deterministic_answer
+                return ChatResult(
+                    answer=answer,
+                    sources=[
+                        Source(
+                            chunk_id=f"artifact::{doc.doc_id}::{code}",
+                            doc_id=doc.doc_id,
+                            excerpt=source_excerpt[:400],
+                            score=1.0,
+                            metadata={
+                                "source_filename": doc.filename,
+                                "citation_label": "registro de catalogo (artefato prata)",
+                                "source_kind": "artifact_lookup",
+                                "artifact_record": record,
+                                "artifact_profiles": profiles,
+                                "target_column": resolved_column,
+                                "page_number": page_number,
+                            },
+                        )
+                    ],
+                    request_id=request_id,
+                )
+        title = description or f"codigo {code}"
+        return ChatResult(
+            answer=_catalog_field_unavailable_answer(
+                code=code,
+                title=title,
+                semantic_type=requested_field[1],
+                label=requested_field[2],
+                record=record,
+            ),
+            sources=[
+                Source(
+                    chunk_id=f"artifact::{doc.doc_id}::{code}",
+                    doc_id=doc.doc_id,
+                    excerpt=source_excerpt[:400],
+                    score=1.0,
+                    metadata={
+                        "source_filename": doc.filename,
+                        "citation_label": "registro de catalogo (artefato prata)",
+                        "source_kind": "artifact_lookup",
+                        "artifact_record": record,
+                        "artifact_profiles": profiles,
+                        "page_number": page_number,
+                    },
+                )
+            ],
+            request_id=request_id,
+        )
+
+    answer = (
+        f"Encontrei o codigo {code} no artefato processado."
+        + (f" Trecho associado: {description}." if description else f" Contexto encontrado: {source_excerpt[:280]}.")
+    )
+    return ChatResult(
+        answer=answer,
+        sources=[
+            Source(
+                chunk_id=f"artifact::{doc.doc_id}::{code}",
+                doc_id=doc.doc_id,
+                excerpt=source_excerpt[:400],
+                score=1.0,
+                metadata={
+                    "source_filename": doc.filename,
+                    "citation_label": "registro de catalogo (artefato prata)",
+                    "source_kind": "artifact_lookup",
+                    "artifact_record": record,
+                    "artifact_profiles": profiles,
+                    "page_number": page_number,
+                },
+            )
+        ],
+        request_id=request_id,
+    )
+
+
+def _answer_catalog_code_from_tabular_artifact(
+    *,
+    doc,
+    code: str,
+    question: str,
+    request_id: str,
+    profiles: list[dict],
+    requested_field: tuple[str, str, str] | None,
+) -> ChatResult | None:
+    artifact = _resolve_processed_tabular_json(doc.doc_id, doc.filename)
+    if not artifact:
+        artifact = _build_tabular_artifact_from_processed_json(doc, profiles)
+    if not artifact:
+        return None
+    try:
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    for item in payload.get("records", []) or []:
+        fields = item.get("fields", {}) or {}
+        candidate_code = ""
+        for key in ["procedimento", "codigo", "code", "id"]:
+            if str(fields.get(key, "")).strip():
+                candidate_code = str(fields.get(key, "")).strip()
+                break
+        if not candidate_code:
+            for value in fields.values():
+                value_str = str(value).strip()
+                if re.fullmatch(r"\d{5,}", value_str):
+                    candidate_code = value_str
+                    break
+        if candidate_code != code:
+            continue
+        source_excerpt = str(item.get("texto_canonico", "")).strip() or str(item.get("raw_row", "")).strip() or json.dumps(fields, ensure_ascii=False)
+        return _chat_result_from_catalog_record(
+            doc=doc,
+            code=code,
+            question=question,
+            request_id=request_id,
+            profiles=profiles,
+            record={str(k): str(v).strip() for k, v in fields.items()},
+            page_number=item.get("page_number"),
+            source_excerpt=source_excerpt,
+            requested_field=requested_field,
+        )
+    return None
+
+
 def _answer_catalog_code_from_artifact(
     *,
     collection: str,
@@ -1536,6 +2164,16 @@ def _answer_catalog_code_from_artifact(
     profiles = _catalog_profiles(workspace_id, collection)
     requested_field = _catalog_field_request(question, workspace_id, collection)
     for doc in documents:
+        tabular_result = _answer_catalog_code_from_tabular_artifact(
+            doc=doc,
+            code=code,
+            question=question,
+            request_id=request_id,
+            profiles=profiles,
+            requested_field=requested_field,
+        )
+        if tabular_result:
+            return tabular_result
         artifact = _resolve_processed_json(doc.doc_id, doc.filename)
         if not artifact:
             continue
@@ -1544,12 +2182,24 @@ def _answer_catalog_code_from_artifact(
         except Exception:
             continue
         blocks = payload.get("blocks", []) or []
-        texts = [str(block.get("text", "")).strip() for block in blocks if str(block.get("text", "")).strip()]
-        compact_blocks = [{"text": str(block.get("text", "")).strip()} for block in blocks if str(block.get("text", "")).strip()]
-        for idx, text in enumerate(texts):
-            if not re.search(rf"\b{re.escape(code)}\b", text):
+        compact_blocks = [
+            {
+                "text": str(block.get("text", "")).strip(),
+                "page_number": block.get("page_number"),
+            }
+            for block in blocks
+            if str(block.get("text", "")).strip()
+        ]
+        candidates: list[dict] = []
+        for idx, block in enumerate(compact_blocks):
+            score = _catalog_code_match_score(block.get("text", ""), code)
+            if score <= 0:
                 continue
-            window = " ".join(part for part in texts[idx:idx + 3] if part).strip()
+            window = " ".join(
+                str(item.get("text", "")).strip()
+                for item in compact_blocks[idx:idx + 3]
+                if str(item.get("text", "")).strip()
+            ).strip()
             compact = re.sub(r"\s+", " ", window)
             record = _extract_catalog_record_from_blocks(compact_blocks, idx, code, profiles=profiles)
             description = ""
@@ -1559,108 +2209,99 @@ def _answer_catalog_code_from_artifact(
                 description = str(record.get(str(candidate), "")).strip()
                 if description:
                     break
-            if requested_field:
-                target_column, semantic_type, label = requested_field
-                field_value = _artifact_catalog_field_value(record, semantic_type, target_column)
-                if field_value:
-                    resolved_column, value = field_value
-                    title = description or f"codigo {code}"
-                    deterministic_answer = _deterministic_catalog_field_answer(
-                        code=code,
-                        title=title,
-                        semantic_type=semantic_type,
-                        label=label,
-                        value=value,
-                    )
-                    answer = deterministic_answer
-                    try:
-                        record_json = json.dumps(record, ensure_ascii=False, indent=2)
-                        prompt_messages = build_catalog_record_messages(
-                            question=question,
-                            target_column=resolved_column,
-                            field_label=label,
-                            record_json=record_json,
-                        )
-                        prompted_answer = llm.chat(
-                            prompt_messages,
-                            system=get_catalog_record_system(),
-                        ).strip()
-                        if _catalog_prompt_answer_is_usable(
-                            answer=prompted_answer,
-                            code=code,
-                            title=title,
-                            semantic_type=semantic_type,
-                            value=value,
-                        ):
-                            answer = prompted_answer
-                    except Exception:
-                        answer = deterministic_answer
-                    preview_parts: list[str] = []
-                    if description:
-                        preview_parts.append(description)
-                    preview_parts.append(str(value).strip())
-                    source_excerpt = re.sub(r"\s+", " ", " ".join(preview_parts)).strip() or compact[:400]
-                    log_event(
-                        logger,
-                        20,
-                        "Catalog field resolved from processed artifact using schema-aware fallback",
-                        request_id=request_id,
-                        collection=collection,
-                        doc_id=doc.doc_id,
-                        code=code,
-                        target_column=resolved_column,
-                        semantic_type=semantic_type,
-                    )
-                    return ChatResult(
-                        answer=answer,
-                        sources=[
-                            Source(
-                                chunk_id=f"artifact::{doc.doc_id}::{code}",
-                                doc_id=doc.doc_id,
-                                excerpt=source_excerpt[:400],
-                                score=1.0,
-                                metadata={
-                                    "source_filename": doc.filename,
-                                    "citation_label": "registro de catalogo (artefato prata)",
-                                    "source_kind": "artifact_lookup",
-                                    "artifact_record": record,
-                                    "artifact_profiles": profiles,
-                                    "target_column": resolved_column,
-                                },
-                            )
-                        ],
-                        request_id=request_id,
-                    )
-            answer = (
-                f"Encontrei o codigo {code} no artefato processado."
-                + (f" Trecho associado: {description}." if description else f" Contexto encontrado: {compact[:280]}.")
+            candidates.append(
+                {
+                    "idx": idx,
+                    "score": score,
+                    "record": record,
+                    "description": description,
+                    "compact": compact,
+                    "page_number": block.get("page_number"),
+                }
             )
-            log_event(
-                logger,
-                20,
-                "Catalog code resolved from processed artifact",
-                request_id=request_id,
-                collection=collection,
-                doc_id=doc.doc_id,
+
+        if not candidates:
+            continue
+
+        candidates.sort(
+            key=lambda item: (
+                item["score"],
+                len(str(item["description"] or "")),
+                -int(item["idx"]),
+            ),
+            reverse=True,
+        )
+
+        best_candidate = candidates[0]
+        if requested_field:
+            target_column, semantic_type, label = requested_field
+            for candidate in candidates:
+                field_value = _artifact_catalog_field_value(candidate["record"], semantic_type, target_column)
+                if not field_value:
+                    continue
+                resolved_column, value = field_value
+                if not _artifact_catalog_field_value_is_usable(resolved_column, value, semantic_type):
+                    continue
+                preview_parts: list[str] = []
+                if candidate["description"]:
+                    preview_parts.append(candidate["description"])
+                preview_parts.append(str(value).strip())
+                source_excerpt = re.sub(r"\s+", " ", " ".join(preview_parts)).strip() or candidate["compact"][:400]
+                log_event(
+                    logger,
+                    20,
+                    "Catalog field resolved from processed artifact using schema-aware fallback",
+                    request_id=request_id,
+                    collection=collection,
+                    doc_id=doc.doc_id,
+                    code=code,
+                    target_column=resolved_column,
+                    semantic_type=semantic_type,
+                )
+                return _chat_result_from_catalog_record(
+                    doc=doc,
+                    code=code,
+                    question=question,
+                    request_id=request_id,
+                    profiles=profiles,
+                    record=candidate["record"],
+                    page_number=candidate["page_number"],
+                    source_excerpt=source_excerpt,
+                    requested_field=requested_field,
+                )
+
+            return _chat_result_from_catalog_record(
+                doc=doc,
                 code=code,
-            )
-            return ChatResult(
-                answer=answer,
-                sources=[
-                    Source(
-                        chunk_id=f"artifact::{doc.doc_id}::{code}",
-                        doc_id=doc.doc_id,
-                        excerpt=compact[:400],
-                        score=1.0,
-                        metadata={
-                            "source_filename": doc.filename,
-                            "citation_label": "registro de catalogo (artefato prata)",
-                            "source_kind": "artifact_lookup",
-                        },
-                    )
-                ],
+                question=question,
                 request_id=request_id,
+                profiles=profiles,
+                record=best_candidate["record"],
+                page_number=best_candidate["page_number"],
+                source_excerpt=str(best_candidate["compact"])[:400],
+                requested_field=requested_field,
             )
+
+        log_event(
+            logger,
+            20,
+            "Catalog code resolved from processed artifact",
+            request_id=request_id,
+            collection=collection,
+            doc_id=doc.doc_id,
+            code=code,
+        )
+        return _chat_result_from_catalog_record(
+            doc=doc,
+            code=code,
+            question=question,
+            request_id=request_id,
+            profiles=profiles,
+            record=best_candidate["record"],
+            page_number=best_candidate["page_number"],
+            source_excerpt=str(best_candidate["compact"])[:400],
+            requested_field=None,
+        )
     return None
 
 

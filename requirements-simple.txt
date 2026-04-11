@@ -4,6 +4,7 @@
 fastapi>=0.111
 uvicorn[standard]>=0.29
 python-multipart>=0.0.12
+pandas>=2.2
 pydantic>=2.7
 pydantic-settings>=2.2
 httpx>=0.27
@@ -23,6 +24,9 @@ nltk>=3.8
 # Document parsing
 docling>=2.80
 pdfplumber>=0.11
+pymupdf>=1.24
+camelot-py>=0.11
+tabula-py>=2.9
 
 # Structured retrieval (optional — used when STRUCTURED_STORE_ENABLED=true)
 duckdb>=1.0

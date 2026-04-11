@@ -79,6 +79,8 @@ FAISS_HNSW_EF_SEARCH=64
 ## Funcionalidades
 
 - Ingere PDF, DOCX, PPTX, XLSX, XLS, CSV, TXT e MD
+- Modulo dedicado para catalogos e bases tabulares em PDF com indexacao configuravel por colunas esperadas
+- Consulta de catalogo por codigo, descricao e filtros simples com fonte e pagina obrigatorias
 - Frontend React separado em abas: `Chat` e `Ingestao`
 - Pipeline por camadas: Bronze (upload), Prata (extracao markdown/json), Ouro (indexacao vetorial)
 - Progresso por estagio em tempo real nos jobs de ingestao (`stage` + `progress_pct`)
@@ -118,6 +120,83 @@ FAISS_HNSW_EF_SEARCH=64
 - Auto-deteccao de documentos juridicos (sem necessidade de configuracao manual)
 
 ## Arquitetura
+
+## Agente de Catalogo Tabular
+
+Este repositorio agora inclui um fluxo dedicado para catalogos e bases tabulares em PDF, pensado para o nosso processo: primeiro estruturar os registros, depois consultar com rastreabilidade, sem depender de RAG semantica complexa.
+
+O perfil medico continua sendo um caso de uso forte, mas o desenho foi feito para reaproveitamento em outros catalogos e tabelas de referencia com estrutura semelhante.
+
+### O que ele faz
+
+- tenta extracao em camadas: `camelot` -> `tabula` -> `PyMuPDF` -> `docling`
+- normaliza colunas via configuracao JSON
+- indexa os registros em `data/medical_catalog/<catalog_id>/index.json`
+- responde apenas com base nos campos extraidos do catalogo ou base tabular
+- sempre devolve fonte e pagina de origem
+- nao inventa informacoes ausentes
+- funciona bem para catálogos de procedimentos, tabelas de codigos, bases de cobertura, regras operacionais e referencias semelhantes
+- aceita variacao de layout desde que a estrutura possa ser descrita por colunas esperadas e aliases
+
+### Endpoints dedicados
+
+| Metodo | Rota | Descricao |
+|--------|------|-----------|
+| `POST` | `/reindex` | reprocessa um PDF de catalogo/base tabular e recria o indice |
+| `GET` | `/procedure/{codigo}` | busca exata por codigo |
+| `POST` | `/ask` | consulta por pergunta textual + filtros |
+
+### Exemplo rapido
+
+PDF de exemplo: [data/docs/rol_procedimentos_teste.pdf](data/docs/rol_procedimentos_teste.pdf)  
+Config de exemplo: [data/catalog_configs/rol_procedimentos_teste.json](data/catalog_configs/rol_procedimentos_teste.json)
+
+```bash
+python scripts/ingest_medical_catalog.py ^
+  --catalog-id rol_teste ^
+  --pdf-path data/docs/rol_procedimentos_teste.pdf ^
+  --config-path data/catalog_configs/rol_procedimentos_teste.json
+```
+
+```bash
+curl -X POST http://localhost:8001/reindex ^
+  -H "Content-Type: application/json" ^
+  -d "{\"catalog_id\":\"rol_teste\",\"pdf_path\":\"data/docs/rol_procedimentos_teste.pdf\",\"config_path\":\"data/catalog_configs/rol_procedimentos_teste.json\"}"
+```
+
+```bash
+curl "http://localhost:8001/procedure/20202020?catalog_id=rol_teste"
+```
+
+```bash
+curl -X POST http://localhost:8001/ask ^
+  -H "Content-Type: application/json" ^
+  -d "{\"catalog_id\":\"rol_teste\",\"question\":\"Quais procedimentos sao de emergencia?\",\"limit\":3}"
+```
+
+### Estrutura nova
+
+- `src/medical_catalog/extraction.py`: extracao com fallback
+- `src/medical_catalog/normalize.py`: normalizacao com Pandas
+- `src/medical_catalog/service.py`: reindex, lookup e ask
+- `src/medical_catalog/api.py`: endpoints FastAPI
+- `scripts/ingest_medical_catalog.py`: ingestao via CLI
+- `tests/test_medical_catalog_service.py`: testes do fluxo principal
+- `tests/test_medical_catalog_routes.py`: testes das rotas dedicadas
+
+### Escopo
+
+Este modulo e generico para catalogos e bases tabulares semelhantes, nao apenas para o `Rol de Procedimentos`.
+
+Cobertura esperada:
+- catalogos medicos com codigo, descricao e regras
+- tabelas de cobertura, SLA, autorizacao e segmentacao
+- bases tabulares com colunas previsiveis e lookup por identificador
+
+Nao e o foco principal:
+- PDFs puramente narrativos
+- documentos sem estrutura tabular reconhecivel
+- layouts totalmente livres sem padrao minimo de colunas
 
 ```text
 Navegador (UI embutida ou React)

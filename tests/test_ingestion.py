@@ -1,5 +1,8 @@
 """Tests for ingestion chunking logic — no external I/O."""
-from src.ingestion import _split, _split_sentences
+import json
+
+from src.ingestion import _save_tabular_artifact, _split, _split_sentences
+from src.tabular import TableRecord
 
 
 def test_split_single_chunk_for_short_text():
@@ -53,6 +56,34 @@ def test_split_fallback_for_long_sentence():
     assert len(chunks) >= 5
     for chunk in chunks:
         assert len(chunk) <= 200
+
+
+def test_save_tabular_artifact_creates_row_level_sidecar(tmp_path):
+    records = [
+        TableRecord(
+            row_index=0,
+            page_number=4,
+            fields={"codigo": "101", "descricao": "Item A"},
+            texto_canonico="codigo: 101; descricao: Item A",
+            raw_row="101 | Item A",
+        )
+    ]
+
+    path = _save_tabular_artifact(
+        base_dir=str(tmp_path),
+        doc_id="catalogo.pdf",
+        collection="rol",
+        table_type="catalog",
+        column_names=["codigo", "descricao"],
+        records=records,
+    )
+
+    payload = json.loads((tmp_path / "catalogo.pdf.tabular.json").read_text(encoding="utf-8"))
+    assert path.endswith(".tabular.json")
+    assert payload["doc_id"] == "catalogo.pdf"
+    assert payload["table_type"] == "catalog"
+    assert payload["records"][0]["fields"]["codigo"] == "101"
+    assert payload["records"][0]["page_number"] == 4
 
 
 def test_split_sentence_aware_overlap():

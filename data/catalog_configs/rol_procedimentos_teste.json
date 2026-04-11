@@ -1,0 +1,46 @@
+{
+  "catalog_id": "rol_teste",
+  "expected_columns": [
+    "codigo",
+    "descricao",
+    "emergencia",
+    "precisa_autorizacao"
+  ],
+  "aliases": {
+    "descricao": [
+      "procedimento",
+      "descricao",
+      "descrição",
+      "descricao_unimed_poa"
+    ],
+    "codigo": [
+      "codigo",
+      "código"
+    ],
+    "precisa_autorizacao": [
+      "precisa_autorizacao",
+      "precisa autorização",
+      "autorizacao",
+      "orientacao_autorizacao"
+    ]
+  },
+  "required_columns": [
+    "codigo",
+    "descricao"
+  ],
+  "code_column": "codigo",
+  "description_column": "descricao",
+  "search_columns": [
+    "codigo",
+    "descricao",
+    "emergencia",
+    "precisa_autorizacao"
+  ],
+  "filterable_columns": [
+    "emergencia",
+    "precisa_autorizacao"
+  ],
+  "code_pattern": "^\\d{4,}$",
+  "pages": "all",
+  "start_after": "Tabela para validacao de ingestao tabular e consulta estruturada."
+}

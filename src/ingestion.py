@@ -37,6 +37,43 @@ from src.utils import chunk_id, get_logger, log_event
 logger = get_logger(__name__)
 
 
+def _processed_artifact_path(base_dir: str, doc_id: str, suffix: str) -> Path:
+    out_dir = Path(base_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"{doc_id}{suffix}"
+
+
+def _save_tabular_artifact(
+    *,
+    base_dir: str,
+    doc_id: str,
+    collection: str,
+    table_type: str,
+    column_names: list[str],
+    records: list,
+) -> str:
+    payload = {
+        "doc_id": doc_id,
+        "collection": collection,
+        "table_type": table_type,
+        "column_names": list(column_names),
+        "records": [
+            {
+                "row_index": getattr(record, "row_index", None),
+                "page_number": getattr(record, "page_number", None),
+                "fields": getattr(record, "fields", {}),
+                "texto_canonico": getattr(record, "texto_canonico", ""),
+                "raw_row": getattr(record, "raw_row", ""),
+            }
+            for record in records
+        ],
+    }
+    path = _processed_artifact_path(base_dir, doc_id, ".tabular.json")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_event(logger, 20, "Tabular artifact saved", doc_id=doc_id, path=str(path), rows=len(payload["records"]))
+    return str(path)
+
+
 def _build_pdf_page_context(blocks: list) -> dict[int, dict]:
     return _build_pdf_page_context_impl(blocks)
 
@@ -1047,6 +1084,20 @@ def _ingest_tabular(
 
     inferred_profiles = infer_profiles_from_records(extraction.column_names, extraction.records)
     inferred_table_type = infer_table_type(inferred_profiles)
+    try:
+        _save_tabular_artifact(
+            base_dir=settings.pdf_pipeline_artifacts_dir,
+            doc_id=doc_id,
+            collection=collection,
+            table_type=inferred_table_type,
+            column_names=extraction.column_names,
+            records=extraction.records,
+        )
+    except Exception as exc:
+        log_event(
+            logger, 30, "Tabular artifact save failed; continuing with ingestion",
+            collection=collection, doc_id=doc_id, error=str(exc),
+        )
     chunk_group_size = 1 if inferred_table_type == "catalog" else settings.tabular_chunk_group_size
     chunked = chunk_tabular_records(
         extraction.records,
